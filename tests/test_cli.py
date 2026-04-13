@@ -10,17 +10,7 @@ from unifi_cli.config import build_config
 from unifi_cli.core import UniFiClient
 
 
-def test_help_mentions_core_commands() -> None:
-    help_text = build_parser().format_help()
-    assert "doctor" in help_text
-    assert "summary" in help_text
-    assert "request" in help_text
-
-
-def test_doctor_json_without_config_reports_missing(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path
-) -> None:
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+def clear_unifi_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for env_name in [
         "UNIFI_API_KEY",
         "UNIFI_NETWORK_API_KEY",
@@ -33,6 +23,20 @@ def test_doctor_json_without_config_reports_missing(
     ]:
         monkeypatch.delenv(env_name, raising=False)
 
+
+def test_help_mentions_core_commands() -> None:
+    help_text = build_parser().format_help()
+    assert "doctor" in help_text
+    assert "summary" in help_text
+    assert "request" in help_text
+
+
+def test_doctor_json_without_config_reports_missing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path
+) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    clear_unifi_env(monkeypatch)
+
     exit_code = main(["--json", "doctor"])
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
@@ -44,6 +48,7 @@ def test_doctor_json_without_config_reports_missing(
 
 def test_build_config_accepts_legacy_env_aliases(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    clear_unifi_env(monkeypatch)
     monkeypatch.setenv("UNIFI_NETWORK_BASE_URL", "https://legacy-controller.local/")
     monkeypatch.setenv("UNIFI_NETWORK_API_KEY", "secret")
 
@@ -88,6 +93,7 @@ def test_raw_post_without_yes_returns_dry_run_json(capsys: pytest.CaptureFixture
 def test_doctor_json_with_mocked_live_check(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    clear_unifi_env(monkeypatch)
     monkeypatch.setattr(
         UniFiClient,
         "integration",
@@ -116,6 +122,7 @@ def test_json_error_shape_for_missing_live_config(
     capsys: pytest.CaptureFixture[str], tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    clear_unifi_env(monkeypatch)
     exit_code = main(["--json", "sites"])
     payload = json.loads(capsys.readouterr().out)
 
