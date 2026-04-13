@@ -1,0 +1,70 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-binaries:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+          - runner: macos-13
+          - runner: macos-14
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build release archive
+        run: |
+          chmod +x ./scripts/build-release-binaries.sh
+          ./scripts/build-release-binaries.sh "${GITHUB_REF_NAME}" release
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-${{ matrix.runner }}
+          path: release/*.tar.gz
+          if-no-files-found: error
+
+  publish-release:
+    needs: build-binaries
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Download release archives
+        uses: actions/download-artifact@v5
+        with:
+          path: release-assets
+
+      - name: Generate checksums
+        run: |
+          find release-assets -type f -name '*.tar.gz' -print0 | sort -z | xargs -0 sha256sum > release-assets/checksums.txt
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          mapfile -t assets < <(find release-assets -type f -name '*.tar.gz' | sort)
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${assets[@]}" release-assets/checksums.txt --clobber
+          else
+            gh release create "$TAG" "${assets[@]}" release-assets/checksums.txt --verify-tag --generate-notes
+          fi
