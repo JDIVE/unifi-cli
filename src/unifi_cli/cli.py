@@ -23,7 +23,11 @@ from unifi_cli.core import (
     command_client_forget,
     command_client_show,
     command_clients,
+    command_connector_request,
+    command_countries,
     command_device_action,
+    command_device_adopt,
+    command_device_remove,
     command_device_show,
     command_device_statistics,
     command_device_tags,
@@ -32,6 +36,8 @@ from unifi_cli.core import (
     command_dns_policies,
     command_dns_policy_show,
     command_dns_upsert,
+    command_dpi_applications,
+    command_dpi_categories,
     command_firewall_audit,
     command_firewall_policies,
     command_firewall_zones,
@@ -53,6 +59,7 @@ from unifi_cli.core import (
     command_official_patch,
     command_official_reorder,
     command_official_show,
+    command_pending_devices,
     command_port_action,
     command_radius_profiles,
     command_remembered_client_show,
@@ -67,6 +74,7 @@ from unifi_cli.core import (
     command_voucher_delete,
     command_voucher_show,
     command_vouchers,
+    command_vouchers_delete,
     command_vouchers_generate,
     command_vpn_servers,
     command_wans,
@@ -106,6 +114,22 @@ def add_merge_args(parser: argparse.ArgumentParser) -> None:
         metavar="KEY=VALUE",
         help="repeatable dotted assignment such as enabled=false",
     )
+    add_write_guard(parser)
+
+
+def add_connector_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("console_id", help="UniFi console id from Site Manager")
+    parser.add_argument(
+        "path",
+        help="proxied application path such as network/integration/v1/sites",
+    )
+    parser.add_argument(
+        "--cloud-base-url",
+        default="https://api.ui.com",
+        help="UniFi Site Manager API base URL",
+    )
+    parser.add_argument("--data-json", help="JSON body to forward")
+    add_query_args(parser)
     add_write_guard(parser)
 
 
@@ -219,6 +243,30 @@ def build_parser() -> argparse.ArgumentParser:
         list_func=command_devices,
         show_func=command_device_show,
     )
+    pending_devices = subparsers.add_parser(
+        "pending-devices", help="list devices pending adoption via official API"
+    )
+    add_list_args(pending_devices)
+    pending_devices.set_defaults(func=command_pending_devices)
+
+    device_adopt = subparsers.add_parser("device-adopt", help="adopt a pending UniFi device")
+    device_adopt.add_argument("--mac-address", help="pending device MAC address")
+    device_adopt.add_argument(
+        "--ignore-device-limit",
+        action="store_true",
+        help="set the official ignoreDeviceLimit field",
+    )
+    device_adopt.add_argument("--data-json", help="full JSON body, used instead of flags")
+    add_write_guard(device_adopt)
+    device_adopt.set_defaults(func=command_device_adopt)
+
+    device_remove = subparsers.add_parser(
+        "device-remove", help="remove / unadopt one adopted UniFi device"
+    )
+    device_remove.add_argument("selector")
+    add_write_guard(device_remove)
+    device_remove.set_defaults(func=command_device_remove)
+
     device_statistics = subparsers.add_parser(
         "device-statistics", help="show latest statistics for one adopted device"
     )
@@ -416,6 +464,14 @@ def build_parser() -> argparse.ArgumentParser:
         add_list_args(item)
         item.set_defaults(func=func)
 
+    for name, metadata_func, help_text in [
+        ("dpi-categories", command_dpi_categories, "list official DPI application categories"),
+        ("dpi-applications", command_dpi_applications, "list official DPI applications"),
+        ("countries", command_countries, "list official country metadata"),
+    ]:
+        item = subparsers.add_parser(name, help=help_text)
+        item.set_defaults(func=metadata_func)
+
     voucher_show = subparsers.add_parser("voucher-show", help="show one official hotspot voucher")
     voucher_show.add_argument("selector")
     voucher_show.set_defaults(func=command_voucher_show)
@@ -431,6 +487,13 @@ def build_parser() -> argparse.ArgumentParser:
     voucher_delete.add_argument("selector")
     add_write_guard(voucher_delete)
     voucher_delete.set_defaults(func=command_voucher_delete)
+
+    vouchers_delete = subparsers.add_parser(
+        "vouchers-delete", help="bulk-delete hotspot vouchers by official filter"
+    )
+    vouchers_delete.add_argument("--filter", required=True, help="official voucher filter string")
+    add_write_guard(vouchers_delete)
+    vouchers_delete.set_defaults(func=command_vouchers_delete)
 
     fallback_types = subparsers.add_parser(
         "legacy-fallback-types",
@@ -469,6 +532,15 @@ def build_parser() -> argparse.ArgumentParser:
     fallback_delete.add_argument("selector")
     add_write_guard(fallback_delete)
     fallback_delete.set_defaults(func=command_legacy_fallback_delete)
+
+    for method in ["GET", "POST", "PUT", "DELETE", "PATCH"]:
+        command_name = f"connector-{method.lower()}"
+        connector = subparsers.add_parser(
+            command_name,
+            help=f"forward a {method} request through the official Cloud Connector API",
+        )
+        add_connector_args(connector)
+        connector.set_defaults(func=bind(command_connector_request, method))
 
     request_parser = subparsers.add_parser(
         "request",

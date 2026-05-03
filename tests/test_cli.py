@@ -90,6 +90,91 @@ def test_raw_post_without_yes_returns_dry_run_json(capsys: pytest.CaptureFixture
     assert payload["request"]["method"] == "POST"
 
 
+def test_device_adopt_without_yes_returns_official_dry_run_json(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exit_code = main(
+        [
+            "--json",
+            "--base-url",
+            "https://controller.example",
+            "--api-key",
+            "secret",
+            "--site-id",
+            "site-1",
+            "device-adopt",
+            "--mac-address",
+            "00:11:22:33:44:55",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert payload["status"] == "dry-run"
+    assert payload["request"]["method"] == "POST"
+    assert payload["request"]["path"] == "/proxy/network/integration/v1/sites/site-1/devices"
+    assert payload["request"]["payload"] == {
+        "ignoreDeviceLimit": False,
+        "macAddress": "00:11:22:33:44:55",
+    }
+
+
+def test_vouchers_delete_requires_filter_and_returns_dry_run_path(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exit_code = main(
+        [
+            "--json",
+            "--base-url",
+            "https://controller.example",
+            "--api-key",
+            "secret",
+            "--site-id",
+            "site-1",
+            "vouchers-delete",
+            "--filter",
+            "name.eq('guest')",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert payload["status"] == "dry-run"
+    assert payload["request"]["method"] == "DELETE"
+    assert (
+        payload["request"]["path"] == "/proxy/network/integration/v1/sites/site-1/hotspot/vouchers?"
+        "filter=name.eq%28%27guest%27%29"
+    )
+    assert payload["request"]["payload"] is None
+
+
+def test_connector_write_without_yes_returns_cloud_dry_run_json(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exit_code = main(
+        [
+            "--json",
+            "--api-key",
+            "secret",
+            "connector-post",
+            "console-1",
+            "network/integration/v1/sites",
+            "--data-json",
+            "{}",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert payload["status"] == "dry-run"
+    assert payload["request"]["method"] == "POST"
+    assert (
+        payload["request"]["path"]
+        == "https://api.ui.com/v1/connector/consoles/console-1/network/integration/v1/sites"
+    )
+    assert payload["request"]["payload"] == {}
+
+
 def test_doctor_json_with_mocked_live_check(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

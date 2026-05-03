@@ -211,8 +211,8 @@ class UniFiError(RuntimeError):
         return self.message
 
 
-def ensure_live_config(config: Config) -> None:
-    if not config.base_url:
+def ensure_live_config(config: Config, *, require_base_url: bool = True) -> None:
+    if require_base_url and not config.base_url:
         raise UniFiError(
             "Missing UniFi base URL.",
             code="config_missing",
@@ -320,6 +320,17 @@ def parse_query_pairs(pairs: list[str]) -> dict[str, Any]:
     return query
 
 
+def path_with_query(path: str, query: dict[str, Any]) -> str:
+    encoded_query = urllib.parse.urlencode(
+        [(key, str(value)) for key, value in query.items() if value is not None],
+        doseq=True,
+    )
+    if not encoded_query:
+        return path
+    separator = "&" if urllib.parse.urlparse(path).query else "?"
+    return f"{path}{separator}{encoded_query}"
+
+
 def normalise_record_type(record_type: str) -> str:
     value = record_type.strip().upper()
     if value == "A":
@@ -374,11 +385,9 @@ class UniFiClient:
         query: dict[str, Any] | None = None,
         payload: Any | None = None,
     ) -> Any:
-        ensure_live_config(self.config)
-        if path.startswith("http://") or path.startswith("https://"):
-            url = path
-        else:
-            url = f"{self.config.base_url}{path}"
+        is_absolute_url = path.startswith("http://") or path.startswith("https://")
+        ensure_live_config(self.config, require_base_url=not is_absolute_url)
+        url = path if is_absolute_url else f"{self.config.base_url}{path}"
 
         if query:
             encoded_query = urllib.parse.urlencode(
@@ -676,9 +685,13 @@ class UniFiClient:
             "device_tags": self.official(
                 "GET", f"/sites/{site_id}/device-tags", query={"limit": 500}
             ),
+            "pending_devices": self.official("GET", "/pending-devices", query={"limit": 500}),
             "dns_policies": self.official(
                 "GET", f"/sites/{site_id}/dns/policies", query={"limit": 500}
             ),
+            "dpi_categories": self.official("GET", "/dpi/categories", query={"limit": 500}),
+            "dpi_applications": self.official("GET", "/dpi/applications", query={"limit": 500}),
+            "countries": self.official("GET", "/countries", query={"limit": 500}),
             "firewall_policies": self.official(
                 "GET", f"/sites/{site_id}/firewall/policies", query={"limit": 500}
             ),
@@ -800,6 +813,12 @@ def require_capability(spec: OfficialResource, capability: str) -> None:
 
 def official_dry_run_path(client: UniFiClient, suffix: str) -> str:
     return f"{OFFICIAL_API_BASE}{suffix}"
+
+
+def connector_dry_run_path(base_url: str, console_id: str, connector_path: str) -> str:
+    clean_base = base_url.rstrip("/")
+    clean_path = connector_path.lstrip("/")
+    return f"{clean_base}/v1/connector/consoles/{console_id}/{clean_path}"
 
 
 def legacy_dry_run_path(client: UniFiClient, suffix: str, *, v2: bool = False) -> str:
@@ -1041,6 +1060,35 @@ def command_devices(client: UniFiClient, args: argparse.Namespace) -> Any:
 
 def command_device_show(client: UniFiClient, args: argparse.Namespace) -> Any:
     return command_official_show(client, args, "device")
+
+
+def command_pending_devices(client: UniFiClient, args: argparse.Namespace) -> Any:
+    return client.official("GET", "/pending-devices", query=with_limit(args))
+
+
+def command_device_adopt(client: UniFiClient, args: argparse.Namespace) -> Any:
+    if args.data_json:
+        payload = parse_data_json(args.data_json)
+    else:
+        if not args.mac_address:
+            raise UniFiError(
+                "device-adopt requires --mac-address or --data-json.",
+                code="invalid_argument",
+            )
+        payload = {
+            "ignoreDeviceLimit": bool(args.ignore_device_limit),
+            "macAddress": args.mac_address,
+        }
+    suffix = f"/sites/{client.site_id()}/devices"
+    require_confirmation(args, "POST", official_dry_run_path(client, suffix), payload)
+    return client.official("POST", suffix, payload=payload)
+
+
+def command_device_remove(client: UniFiClient, args: argparse.Namespace) -> Any:
+    device = client.find_official("device", args.selector)
+    suffix = f"/sites/{client.site_id()}/devices/{device['id']}"
+    require_confirmation(args, "DELETE", official_dry_run_path(client, suffix), device)
+    return client.official("DELETE", suffix)
 
 
 def command_device_statistics(client: UniFiClient, args: argparse.Namespace) -> Any:
@@ -1289,6 +1337,39 @@ def command_voucher_delete(client: UniFiClient, args: argparse.Namespace) -> Any
     suffix = f"/sites/{client.site_id()}/hotspot/vouchers/{args.selector}"
     require_confirmation(args, "DELETE", official_dry_run_path(client, suffix), {})
     return client.official("DELETE", suffix)
+
+
+def command_vouchers_delete(client: UniFiClient, args: argparse.Namespace) -> Any:
+    query = {"filter": args.filter}
+    suffix = f"/sites/{client.site_id()}/hotspot/vouchers"
+    dry_run_path = path_with_query(official_dry_run_path(client, suffix), query)
+    require_confirmation(args, "DELETE", dry_run_path, None)
+    return client.official("DELETE", suffix, query=query)
+
+
+def command_dpi_categories(client: UniFiClient, _args: argparse.Namespace) -> Any:
+    return client.official("GET", "/dpi/categories")
+
+
+def command_dpi_applications(client: UniFiClient, _args: argparse.Namespace) -> Any:
+    return client.official("GET", "/dpi/applications")
+
+
+def command_countries(client: UniFiClient, _args: argparse.Namespace) -> Any:
+    return client.official("GET", "/countries")
+
+
+def command_connector_request(
+    client: UniFiClient,
+    args: argparse.Namespace,
+    method: str,
+) -> Any:
+    payload = parse_data_json(args.data_json) if args.data_json else None
+    query = parse_query_pairs(args.query)
+    url = connector_dry_run_path(args.cloud_base_url, args.console_id, args.path)
+    if method.upper() != "GET":
+        require_confirmation(args, method, path_with_query(url, query), payload)
+    return client.request(method, url, query=query, payload=payload)
 
 
 def command_legacy_fallback_types(_client: UniFiClient, _args: argparse.Namespace) -> Any:

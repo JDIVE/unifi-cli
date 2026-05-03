@@ -33,13 +33,14 @@ the preferred path.
 
 ## Features
 
-- official-API reads for sites, app info, devices, clients, networks, WiFi
-  broadcasts, DNS policies, firewall zones/policies, ACL rules, traffic
-  matching lists, WANs, RADIUS profiles, device tags, VPNs, and hotspot
-  vouchers
+- official-API reads for sites, app info, adopted and pending devices, clients,
+  networks, WiFi broadcasts, DNS policies, firewall zones/policies, ACL rules,
+  traffic matching lists, WANs, RADIUS profiles, device tags, VPNs, hotspot
+  vouchers, DPI metadata, and countries
 - official-API guarded writes for networks, WiFi broadcasts, DNS policies,
   firewall zones/policies, ACL rules, traffic matching lists, actions, and
   vouchers where the API supports them
+- official Cloud Connector forwarding commands for Site Manager API paths
 - fetch-merge update helpers with repeatable dotted `--set` assignments
 - dry-run by default for every write, with explicit `--yes` to apply
 - `--json` support for machine-readable success output and structured errors
@@ -153,6 +154,7 @@ Official reads:
 
 - `devices`
 - `device-show`
+- `pending-devices`
 - `device-statistics`
 - `clients`
 - `client-show`
@@ -180,9 +182,14 @@ Official reads:
 - `site-to-site-vpns`
 - `vouchers`
 - `voucher-show`
+- `dpi-categories`
+- `dpi-applications`
+- `countries`
 
 Official guarded writes:
 
+- `device-adopt`
+- `device-remove`
 - `device-action`
 - `port-action`
 - `client-action`
@@ -211,6 +218,15 @@ Official guarded writes:
 - `traffic-matching-list-delete`
 - `vouchers-generate`
 - `voucher-delete`
+- `vouchers-delete`
+
+Official Cloud Connector:
+
+- `connector-get`
+- `connector-post`
+- `connector-put`
+- `connector-delete`
+- `connector-patch`
 
 Legacy fallback commands:
 
@@ -260,12 +276,15 @@ unifi --json doctor
 unifi app-info
 unifi clients --limit 100
 unifi client-show 01:23:45:67:89:ab
+unifi pending-devices
 unifi remembered-client-show 01:23:45:67:89:ab
 unifi dns-policies --limit 100
 unifi firewall-audit --format human
 unifi legacy-fallback-list port-profile
+unifi dpi-categories
 unifi request /proxy/network/integration/v1/sites
 unifi request --method OPTIONS /proxy/network/integration/v1/sites
+unifi connector-get console-id network/integration/v1/sites
 ```
 
 ## Development
