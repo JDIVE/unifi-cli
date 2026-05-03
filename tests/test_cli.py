@@ -7,7 +7,7 @@ import pytest
 
 from unifi_cli.cli import build_parser, main
 from unifi_cli.config import build_config
-from unifi_cli.core import UniFiClient
+from unifi_cli.core import UniFiClient, UniFiError
 
 
 def clear_unifi_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -253,6 +253,119 @@ def test_network_delete_force_is_reflected_in_dry_run_path(
         payload["request"]["path"]
         == "/proxy/network/integration/v1/sites/site-1/networks/network-1?force=true"
     )
+
+
+def test_network_references_falls_back_after_official_500(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    network = {"id": "network-1", "name": "Home", "vlanId": 40}
+
+    monkeypatch.setattr(
+        UniFiClient,
+        "find_official",
+        lambda self, resource, selector, **kwargs: network,
+    )
+
+    def fake_official(self: UniFiClient, method: str, suffix: str, **kwargs):
+        del self, method, kwargs
+        if suffix.endswith("/references"):
+            raise UniFiError(
+                "official references failed",
+                code="http_error",
+                details={"status": 500, "body": "Unexpected error"},
+            )
+        if suffix.endswith("/wifi/broadcasts"):
+            return {
+                "data": [
+                    {
+                        "enabled": True,
+                        "id": "wifi-1",
+                        "name": "Downies",
+                        "network": {"networkId": "network-1"},
+                    }
+                ]
+            }
+        raise AssertionError(f"unexpected official suffix {suffix}")
+
+    def fake_legacy(self: UniFiClient, method: str, suffix: str, **kwargs):
+        del self, method, kwargs
+        if suffix == "/rest/networkconf":
+            return {"data": [{"_id": "legacy-network-1", "name": "Home", "vlan": 40}]}
+        if suffix == "/stat/device":
+            return {
+                "data": [
+                    {
+                        "_id": "device-1",
+                        "name": "Switch",
+                        "port_table": [
+                            {
+                                "name": "Port 1",
+                                "port_idx": 1,
+                                "portconf_id": "port-profile-1",
+                            }
+                        ],
+                    }
+                ]
+            }
+        raise AssertionError(f"unexpected legacy suffix {suffix}")
+
+    monkeypatch.setattr(UniFiClient, "official", fake_official)
+    monkeypatch.setattr(UniFiClient, "legacy", fake_legacy)
+    monkeypatch.setattr(
+        UniFiClient,
+        "list_legacy_fallback",
+        lambda self, resource: {
+            "data": [
+                {
+                    "_id": "port-profile-1",
+                    "name": "Downies",
+                    "native_networkconf_id": "legacy-network-1",
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        UniFiClient,
+        "remembered_clients",
+        lambda self: [
+            {
+                "_id": "client-1",
+                "fixed_ip": "10.1.40.22",
+                "last_connection_network_id": "legacy-network-1",
+                "local_dns_record": "laptop.example",
+                "local_dns_record_enabled": True,
+                "mac": "00:11:22:33:44:55",
+                "name": "Laptop",
+                "use_fixedip": True,
+            }
+        ],
+    )
+
+    exit_code = main(
+        [
+            "--json",
+            "--base-url",
+            "https://controller.example",
+            "--api-key",
+            "secret",
+            "--site-id",
+            "site-1",
+            "network-references",
+            "Home",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert payload["fallback"]["reason"] == "official_network_references_failed"
+    assert payload["network"]["legacyNetworkconfId"] == "legacy-network-1"
+    assert [item["resourceType"] for item in payload["referenceResources"]] == [
+        "WIFI",
+        "LEGACY_PORT_PROFILE",
+        "LEGACY_SWITCH_PORT",
+        "CLIENT",
+    ]
 
 
 def test_doctor_json_with_mocked_live_check(

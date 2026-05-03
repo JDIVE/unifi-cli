@@ -296,6 +296,11 @@ def count_collection(payload: Any) -> int:
     return 0
 
 
+def data_list(payload: Any) -> list[Any]:
+    data = extract_data(payload)
+    return data if isinstance(data, list) else []
+
+
 def with_limit(args: argparse.Namespace) -> dict[str, Any]:
     query: dict[str, Any] = {}
     if getattr(args, "limit", None) is not None:
@@ -318,6 +323,13 @@ def parse_query_pairs(pairs: list[str]) -> dict[str, Any]:
         key, value = pair.split("=", 1)
         query[key] = value
     return query
+
+
+def http_status(error: UniFiError) -> int | None:
+    if not isinstance(error.details, dict):
+        return None
+    status = error.details.get("status")
+    return status if isinstance(status, int) else None
 
 
 def path_with_query(path: str, query: dict[str, Any]) -> str:
@@ -1217,10 +1229,214 @@ def command_network_show(client: UniFiClient, args: argparse.Namespace) -> Any:
     return command_official_show(client, args, "network")
 
 
+def legacy_network_matches(network: dict[str, Any], legacy_network: dict[str, Any]) -> bool:
+    if str(legacy_network.get("name", "")).lower() == str(network.get("name", "")).lower():
+        return True
+    vlan = network.get("vlanId")
+    legacy_vlan = legacy_network.get("vlan")
+    return vlan is not None and legacy_vlan is not None and str(vlan) == str(legacy_vlan)
+
+
+def port_profile_references_network(
+    port_profile: dict[str, Any],
+    legacy_network_id: str,
+) -> bool:
+    candidate_values: list[Any] = [
+        port_profile.get("native_networkconf_id"),
+        port_profile.get("voice_networkconf_id"),
+    ]
+    for key in ["tagged_networkconf_ids", "networkconf_ids"]:
+        values = port_profile.get(key)
+        if isinstance(values, list):
+            candidate_values.extend(values)
+    return legacy_network_id in {str(value) for value in candidate_values if value}
+
+
+def network_reference_resource(
+    resource_type: str,
+    references: list[dict[str, Any]],
+    *,
+    source: str,
+) -> dict[str, Any]:
+    return {
+        "referenceCount": len(references),
+        "referenceSource": source,
+        "references": references,
+        "resourceType": resource_type,
+    }
+
+
+def build_network_references_fallback(
+    client: UniFiClient,
+    network: dict[str, Any],
+    official_error: UniFiError,
+) -> dict[str, Any]:
+    resources: list[dict[str, Any]] = []
+    fallback_errors: list[dict[str, Any]] = []
+    network_id = str(network["id"])
+
+    try:
+        wifi_payload = client.official(
+            "GET", f"/sites/{client.site_id()}/wifi/broadcasts", query={"limit": 500}
+        )
+        wifi_references = [
+            {
+                "enabled": wifi.get("enabled"),
+                "name": wifi.get("name"),
+                "referenceId": wifi.get("id"),
+            }
+            for wifi in data_list(wifi_payload)
+            if isinstance(wifi, dict)
+            and isinstance(wifi.get("network"), dict)
+            and wifi["network"].get("networkId") == network_id
+        ]
+        if wifi_references:
+            resources.append(
+                network_reference_resource(
+                    "WIFI", wifi_references, source="official_wifi_broadcasts"
+                )
+            )
+    except UniFiError as error:
+        fallback_errors.append({"code": error.code, "message": str(error), "source": "wifi"})
+
+    legacy_network_id: str | None = None
+    port_profile_ids: set[str] = set()
+    try:
+        legacy_networks = data_list(client.legacy("GET", "/rest/networkconf"))
+        for item in legacy_networks:
+            if isinstance(item, dict) and legacy_network_matches(network, item):
+                legacy_network_id = str(item["_id"])
+                break
+
+        if legacy_network_id:
+            port_profiles = data_list(client.list_legacy_fallback("port-profile"))
+            port_profile_references = []
+            for profile in port_profiles:
+                if not isinstance(profile, dict):
+                    continue
+                if port_profile_references_network(profile, legacy_network_id):
+                    profile_id = str(profile.get("_id") or "")
+                    if profile_id:
+                        port_profile_ids.add(profile_id)
+                    port_profile_references.append(
+                        {
+                            "name": profile.get("name"),
+                            "nativeNetworkconfId": profile.get("native_networkconf_id"),
+                            "referenceId": profile_id,
+                            "voiceNetworkconfId": profile.get("voice_networkconf_id"),
+                        }
+                    )
+            if port_profile_references:
+                resources.append(
+                    network_reference_resource(
+                        "LEGACY_PORT_PROFILE",
+                        port_profile_references,
+                        source="legacy_port_profiles",
+                    )
+                )
+
+            devices = data_list(client.legacy("GET", "/stat/device"))
+            port_references: list[dict[str, Any]] = []
+            for device in devices:
+                if not isinstance(device, dict):
+                    continue
+                for port in device.get("port_table") or []:
+                    if not isinstance(port, dict):
+                        continue
+                    portconf_id = str(port.get("portconf_id") or "")
+                    native_network_id = str(port.get("native_networkconf_id") or "")
+                    if (
+                        portconf_id not in port_profile_ids
+                        and native_network_id != legacy_network_id
+                    ):
+                        continue
+                    device_id = device.get("_id") or device.get("mac")
+                    port_references.append(
+                        {
+                            "deviceName": device.get("name"),
+                            "nativeNetworkconfId": native_network_id or None,
+                            "portIdx": port.get("port_idx"),
+                            "portName": port.get("name"),
+                            "portProfileId": portconf_id or None,
+                            "referenceId": f"{device_id}:{port.get('port_idx')}",
+                        }
+                    )
+            if port_references:
+                resources.append(
+                    network_reference_resource(
+                        "LEGACY_SWITCH_PORT",
+                        port_references,
+                        source="legacy_device_port_table",
+                    )
+                )
+
+            remembered_references = []
+            for remembered in client.remembered_clients():
+                if not isinstance(remembered, dict):
+                    continue
+                last_network_id = str(remembered.get("last_connection_network_id") or "")
+                override_id = str(remembered.get("virtual_network_override_id") or "")
+                has_static_client_config = any(
+                    [
+                        remembered.get("use_fixedip"),
+                        remembered.get("local_dns_record_enabled"),
+                        remembered.get("virtual_network_override_enabled"),
+                    ]
+                )
+                if not has_static_client_config:
+                    continue
+                if legacy_network_id not in {last_network_id, override_id}:
+                    continue
+                remembered_references.append(
+                    {
+                        "fixedIp": remembered.get("fixed_ip"),
+                        "localDnsRecord": remembered.get("local_dns_record"),
+                        "macAddress": remembered.get("mac"),
+                        "name": remembered.get("name") or remembered.get("hostname"),
+                        "referenceId": remembered.get("_id") or remembered.get("mac"),
+                    }
+                )
+            if remembered_references:
+                resources.append(
+                    network_reference_resource(
+                        "CLIENT",
+                        remembered_references,
+                        source="legacy_remembered_clients",
+                    )
+                )
+    except UniFiError as error:
+        fallback_errors.append({"code": error.code, "message": str(error), "source": "legacy"})
+
+    return {
+        "fallback": {
+            "reason": "official_network_references_failed",
+            "source": "best_effort_local_read_model",
+        },
+        "fallbackErrors": fallback_errors,
+        "network": {
+            "id": network.get("id"),
+            "legacyNetworkconfId": legacy_network_id,
+            "name": network.get("name"),
+            "vlanId": network.get("vlanId"),
+        },
+        "officialError": {
+            "code": official_error.code,
+            "details": scrub_sensitive(official_error.details or {}),
+            "message": str(official_error),
+        },
+        "referenceResources": resources,
+    }
+
+
 def command_network_references(client: UniFiClient, args: argparse.Namespace) -> Any:
     network = client.find_official("network", args.selector)
     suffix = f"/sites/{client.site_id()}/networks/{network['id']}/references"
-    return client.official("GET", suffix)
+    try:
+        return client.official("GET", suffix)
+    except UniFiError as error:
+        if error.code == "http_error" and (http_status(error) or 0) >= 500:
+            return build_network_references_fallback(client, network, error)
+        raise
 
 
 def command_wifi_broadcasts(client: UniFiClient, args: argparse.Namespace) -> Any:

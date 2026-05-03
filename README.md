@@ -41,6 +41,8 @@ the preferred path.
   firewall zones/policies, ACL rules, traffic matching lists, actions, and
   vouchers where the API supports them
 - official Cloud Connector forwarding commands for Site Manager API paths
+- best-effort `network-references` fallback when the official controller
+  endpoint returns a 5xx for networks with local switch/WiFi dependencies
 - fetch-merge update helpers with repeatable dotted `--set` assignments
 - dry-run by default for every write, with explicit `--yes` to apply
 - `--json` support for machine-readable success output and structured errors
@@ -139,6 +141,11 @@ Fetch-merge updates use official item endpoints:
 unifi network-merge Home --set ipv4Configuration.dhcpConfiguration.leaseTimeSeconds=86400
 unifi wifi-broadcast-merge IoT --set enabled=false
 ```
+
+`network-references` uses the official endpoint first. On affected controller
+versions, that endpoint can return a server-side 5xx for networks with active
+switch-port/profile references; the CLI then returns a best-effort read-only
+reference report from official WiFi data plus local configuration/state reads.
 
 ## Command Surface
 
