@@ -170,6 +170,7 @@ Official reads:
 - `firewall-policies`
 - `firewall-policy-show`
 - `firewall-policy-ordering`
+- `firewall-audit`
 - `acl-rules`
 - `acl-rule-show`
 - `acl-rule-ordering`
@@ -279,6 +280,7 @@ unifi client-show 01:23:45:67:89:ab
 unifi pending-devices
 unifi remembered-client-show 01:23:45:67:89:ab
 unifi dns-policies --limit 100
+unifi firewall-policy-ordering --source-zone Internal --destination-zone External
 unifi firewall-audit --format human
 unifi legacy-fallback-list port-profile
 unifi dpi-categories

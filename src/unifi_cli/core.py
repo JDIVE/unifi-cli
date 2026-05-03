@@ -942,8 +942,8 @@ def command_summary(client: UniFiClient, _args: argparse.Namespace) -> Any:
     return client.summary()
 
 
-def command_sites(client: UniFiClient, _args: argparse.Namespace) -> Any:
-    return client.sites()
+def command_sites(client: UniFiClient, args: argparse.Namespace) -> Any:
+    return client.official("GET", "/sites", query=with_limit(args))
 
 
 def command_official_list(
@@ -1026,19 +1026,34 @@ def command_official_delete(
     require_capability(spec, "delete")
     current = client.find_official(spec, args.selector)
     suffix = client.official_item_path(spec, str(current["id"]))
-    require_confirmation(args, "DELETE", official_dry_run_path(client, suffix), current)
-    return client.official("DELETE", suffix)
+    query = {"force": "true"} if getattr(args, "force", False) else {}
+    dry_run_path = path_with_query(official_dry_run_path(client, suffix), query)
+    require_confirmation(args, "DELETE", dry_run_path, current)
+    return client.official("DELETE", suffix, query=query)
+
+
+def firewall_policy_ordering_query(
+    client: UniFiClient,
+    args: argparse.Namespace,
+) -> dict[str, str]:
+    source_zone = client.find_official("firewall-zone", args.source_zone)
+    destination_zone = client.find_official("firewall-zone", args.destination_zone)
+    return {
+        "sourceFirewallZoneId": str(source_zone["id"]),
+        "destinationFirewallZoneId": str(destination_zone["id"]),
+    }
 
 
 def command_official_ordering(
     client: UniFiClient,
-    _args: argparse.Namespace,
+    args: argparse.Namespace,
     resource_name: str,
 ) -> Any:
     spec = official_resource(resource_name)
     require_capability(spec, "ordering")
     suffix = f"{client.official_collection_path(spec)}/ordering"
-    return client.official("GET", suffix)
+    query = firewall_policy_ordering_query(client, args) if spec.name == "firewall-policy" else {}
+    return client.official("GET", suffix, query=query)
 
 
 def command_official_reorder(
@@ -1050,8 +1065,10 @@ def command_official_reorder(
     require_capability(spec, "ordering")
     payload = parse_data_json(args.data_json)
     suffix = f"{client.official_collection_path(spec)}/ordering"
-    require_confirmation(args, "PUT", official_dry_run_path(client, suffix), payload)
-    return client.official("PUT", suffix, payload=payload)
+    query = firewall_policy_ordering_query(client, args) if spec.name == "firewall-policy" else {}
+    dry_run_path = path_with_query(official_dry_run_path(client, suffix), query)
+    require_confirmation(args, "PUT", dry_run_path, payload)
+    return client.official("PUT", suffix, query=query, payload=payload)
 
 
 def command_devices(client: UniFiClient, args: argparse.Namespace) -> Any:
@@ -1347,16 +1364,16 @@ def command_vouchers_delete(client: UniFiClient, args: argparse.Namespace) -> An
     return client.official("DELETE", suffix, query=query)
 
 
-def command_dpi_categories(client: UniFiClient, _args: argparse.Namespace) -> Any:
-    return client.official("GET", "/dpi/categories")
+def command_dpi_categories(client: UniFiClient, args: argparse.Namespace) -> Any:
+    return client.official("GET", "/dpi/categories", query=with_limit(args))
 
 
-def command_dpi_applications(client: UniFiClient, _args: argparse.Namespace) -> Any:
-    return client.official("GET", "/dpi/applications")
+def command_dpi_applications(client: UniFiClient, args: argparse.Namespace) -> Any:
+    return client.official("GET", "/dpi/applications", query=with_limit(args))
 
 
-def command_countries(client: UniFiClient, _args: argparse.Namespace) -> Any:
-    return client.official("GET", "/countries")
+def command_countries(client: UniFiClient, args: argparse.Namespace) -> Any:
+    return client.official("GET", "/countries", query=with_limit(args))
 
 
 def command_connector_request(

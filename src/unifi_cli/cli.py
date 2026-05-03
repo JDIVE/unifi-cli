@@ -175,6 +175,12 @@ def add_official_crud(
     if spec.supports_delete:
         delete_parser = subparsers.add_parser(f"{noun}-delete", help=f"delete one {noun}")
         delete_parser.add_argument("selector")
+        if resource in {"network", "wifi-broadcast"}:
+            delete_parser.add_argument(
+                "--force",
+                action="store_true",
+                help="set the official force=true query parameter",
+            )
         add_write_guard(delete_parser)
         delete_parser.set_defaults(func=bind(command_official_delete, resource))
 
@@ -182,11 +188,17 @@ def add_official_crud(
         ordering_parser = subparsers.add_parser(
             f"{noun}-ordering", help=f"show user-defined {noun} ordering"
         )
+        if resource == "firewall-policy":
+            ordering_parser.add_argument("--source-zone", required=True)
+            ordering_parser.add_argument("--destination-zone", required=True)
         ordering_parser.set_defaults(func=bind(command_official_ordering, resource))
 
         reorder_parser = subparsers.add_parser(
             f"{noun}-reorder", help=f"replace user-defined {noun} ordering"
         )
+        if resource == "firewall-policy":
+            reorder_parser.add_argument("--source-zone", required=True)
+            reorder_parser.add_argument("--destination-zone", required=True)
         add_data_json(reorder_parser)
         add_write_guard(reorder_parser)
         reorder_parser.set_defaults(func=bind(command_official_reorder, resource))
@@ -233,6 +245,7 @@ def build_parser() -> argparse.ArgumentParser:
     summary.set_defaults(func=command_summary)
 
     sites = subparsers.add_parser("sites", help="list local sites")
+    add_list_args(sites)
     sites.set_defaults(func=command_sites)
 
     add_official_crud(
@@ -470,6 +483,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("countries", command_countries, "list official country metadata"),
     ]:
         item = subparsers.add_parser(name, help=help_text)
+        add_list_args(item)
         item.set_defaults(func=metadata_func)
 
     voucher_show = subparsers.add_parser("voucher-show", help="show one official hotspot voucher")

@@ -175,6 +175,86 @@ def test_connector_write_without_yes_returns_cloud_dry_run_json(
     assert payload["request"]["payload"] == {}
 
 
+def test_firewall_policy_reorder_includes_required_zone_query(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def fake_find_official(
+        self: UniFiClient,
+        resource: str,
+        selector: str,
+        *,
+        record_type: str | None = None,
+    ) -> dict[str, str]:
+        del self, resource, record_type
+        return {"id": f"{selector}-id"}
+
+    monkeypatch.setattr(UniFiClient, "find_official", fake_find_official)
+
+    exit_code = main(
+        [
+            "--json",
+            "--base-url",
+            "https://controller.example",
+            "--api-key",
+            "secret",
+            "--site-id",
+            "site-1",
+            "firewall-policy-reorder",
+            "--source-zone",
+            "internal",
+            "--destination-zone",
+            "external",
+            "--data-json",
+            '{"orderedFirewallPolicyIds":[]}',
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert payload["status"] == "dry-run"
+    assert payload["request"]["method"] == "PUT"
+    assert (
+        payload["request"]["path"]
+        == "/proxy/network/integration/v1/sites/site-1/firewall/policies/ordering?"
+        "sourceFirewallZoneId=internal-id&destinationFirewallZoneId=external-id"
+    )
+
+
+def test_network_delete_force_is_reflected_in_dry_run_path(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        UniFiClient,
+        "find_official",
+        lambda self, resource, selector, **kwargs: {"id": "network-1", "name": selector},
+    )
+
+    exit_code = main(
+        [
+            "--json",
+            "--base-url",
+            "https://controller.example",
+            "--api-key",
+            "secret",
+            "--site-id",
+            "site-1",
+            "network-delete",
+            "Home",
+            "--force",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert payload["status"] == "dry-run"
+    assert (
+        payload["request"]["path"]
+        == "/proxy/network/integration/v1/sites/site-1/networks/network-1?force=true"
+    )
+
+
 def test_doctor_json_with_mocked_live_check(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
