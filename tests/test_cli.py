@@ -96,8 +96,12 @@ def test_doctor_json_with_mocked_live_check(
     clear_unifi_env(monkeypatch)
     monkeypatch.setattr(
         UniFiClient,
-        "integration",
-        lambda self, method, suffix, **kwargs: {"data": [{"id": "site-1", "name": "default"}]},
+        "official",
+        lambda self, method, suffix, **kwargs: (
+            {"applicationVersion": "10.3.58"}
+            if suffix == "/info"
+            else {"data": [{"id": "site-1", "name": "default"}]}
+        ),
     )
 
     exit_code = main(

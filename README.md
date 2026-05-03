@@ -1,18 +1,50 @@
 # unifi-cli
 
-`unifi` is a safe, scriptable UniFi Network CLI for inventory, DNS,
-reservations, firewall inspection, and guarded controller writes.
+`unifi` is a safe, scriptable UniFi Network CLI built around the official local
+UniFi Network API.
 
-It is designed for both humans in a terminal and non-interactive agents that
-need stable subcommands and machine-readable output.
+It is designed for humans in a terminal and for non-interactive agents that need
+stable subcommands, machine-readable output, dry-run writes, and predictable
+error shapes.
+
+## API Model
+
+Primary API surface:
+
+- Official local Network API:
+  `/proxy/network/integration/v1/...`
+- Public reference:
+  <https://developer.ui.com/network/v10.1.84/gettingstarted>
+
+Legacy and local fallback routes are intentionally limited to features that are
+not currently exposed by the official Network API surface:
+
+- remembered-client state used for DHCP reservations and per-client local DNS
+- switch port profiles
+- port forwards
+- static routes
+- dynamic DNS
+- user groups
+- content-filtering profiles
+- older traffic routes distinct from official traffic matching lists
+
+The fallback commands are named as fallbacks so callers do not mistake them for
+the preferred path.
 
 ## Features
 
-- read-first command surface for sites, devices, clients, networks, WLANs,
-  WANs, DNS, firewall zones, traffic routes, and generic legacy resources
-- guarded write commands with dry-run by default and explicit `--yes` to apply
+- official-API reads for sites, app info, devices, clients, networks, WiFi
+  broadcasts, DNS policies, firewall zones/policies, ACL rules, traffic
+  matching lists, WANs, RADIUS profiles, device tags, VPNs, and hotspot
+  vouchers
+- official-API guarded writes for networks, WiFi broadcasts, DNS policies,
+  firewall zones/policies, ACL rules, traffic matching lists, actions, and
+  vouchers where the API supports them
+- fetch-merge update helpers with repeatable dotted `--set` assignments
+- dry-run by default for every write, with explicit `--yes` to apply
 - `--json` support for machine-readable success output and structured errors
-- `doctor` command for config, auth, and live API verification
+- `doctor` command for config, auth, application version, and live API
+  verification
 - raw API escape hatch that stays read-only by default
 - installable as a normal Python package and releasable as standalone binaries
 
@@ -81,71 +113,125 @@ timeout_seconds = 30
 
 The CLI never prints your API key.
 
-## Quick start
+## Quick Start
 
 ```bash
 unifi --json doctor
+unifi app-info
 unifi summary
-unifi clients
-unifi client-show office-ap
-unifi dns-static
+unifi networks
+unifi network-show Home
+unifi dns-policies
+unifi firewall-policies
 ```
 
 Writes are dry-run by default:
 
 ```bash
-unifi dns-upsert --key nas.example.internal --record-type A --value 10.0.10.15
-unifi dns-upsert --key nas.example.internal --record-type A --value 10.0.10.15 --yes
+unifi dns-upsert --domain nas.example.internal --record-type A --value 10.0.10.15
+unifi dns-upsert --domain nas.example.internal --record-type A --value 10.0.10.15 --yes
 ```
 
-## Command surface
+Fetch-merge updates use official item endpoints:
 
-Read and discovery:
+```bash
+unifi network-merge Home --set ipv4Configuration.dhcpConfiguration.leaseTimeSeconds=86400
+unifi wifi-broadcast-merge IoT --set enabled=false
+```
+
+## Command Surface
+
+Core:
 
 - `doctor`
+- `app-info`
 - `summary`
 - `sites`
+- `request` / `raw`
+
+Official reads:
+
 - `devices`
+- `device-show`
+- `device-statistics`
 - `clients`
 - `client-show`
 - `networks`
 - `network-show`
-- `wlans`
-- `wans`
-- `dns-static`
-- `dns-policies`
+- `network-references`
+- `wifi-broadcasts` / `wlans`
+- `wifi-broadcast-show`
+- `dns-policies` / `dns-static`
+- `dns-show`
 - `firewall-zones`
+- `firewall-zone-show`
 - `firewall-policies`
-- `firewall-audit`
-- `traffic-routes`
-- `content-filtering`
-- `resource-types`
-- `resource-list`
-- `resource-show`
+- `firewall-policy-show`
+- `firewall-policy-ordering`
+- `acl-rules`
+- `acl-rule-show`
+- `acl-rule-ordering`
+- `traffic-matching-lists`
+- `traffic-matching-list-show`
+- `wans`
+- `radius-profiles`
+- `device-tags`
+- `vpn-servers`
+- `site-to-site-vpns`
+- `vouchers`
+- `voucher-show`
 
-Guarded writes:
+Official guarded writes:
 
+- `device-action`
+- `port-action`
+- `client-action`
+- `network-create`
+- `network-merge`
+- `network-delete`
+- `wifi-broadcast-create`
+- `wifi-broadcast-merge`
+- `wifi-broadcast-delete`
+- `dns-upsert`
+- `dns-delete`
+- `firewall-zone-create`
+- `firewall-zone-merge`
+- `firewall-zone-delete`
+- `firewall-policy-create`
+- `firewall-policy-merge`
+- `firewall-policy-patch`
+- `firewall-policy-delete`
+- `firewall-policy-reorder`
+- `acl-rule-create`
+- `acl-rule-merge`
+- `acl-rule-delete`
+- `acl-rule-reorder`
+- `traffic-matching-list-create`
+- `traffic-matching-list-merge`
+- `traffic-matching-list-delete`
+- `vouchers-generate`
+- `voucher-delete`
+
+Legacy fallback commands:
+
+- `remembered-clients`
+- `remembered-client-show`
 - `reservation-set`
 - `reservation-clear`
 - `local-dns-set`
 - `local-dns-clear`
 - `client-forget`
-- `network-merge`
-- `dns-upsert`
-- `dns-delete`
-- `resource-create`
-- `resource-merge`
-- `resource-delete`
+- `legacy-fallback-types`
+- `legacy-fallback-list`
+- `legacy-fallback-show`
+- `legacy-fallback-merge`
+- `legacy-fallback-delete`
 
-Escape hatch:
-
-- `request` (alias: `raw`)
-
-## JSON behaviour
+## JSON Behaviour
 
 With `--json`, successful commands emit command-native JSON:
 
-- discovery and read commands return the underlying controller payloads
+- official reads return the underlying controller payloads
 - helper commands such as `doctor`, `summary`, and `firewall-audit` return
   structured CLI-owned objects
 - dry-run write previews return a JSON object with the proposed request
@@ -171,10 +257,13 @@ Secrets are redacted from both success and error output.
 
 ```bash
 unifi --json doctor
-unifi clients --online
+unifi app-info
+unifi clients --limit 100
 unifi client-show 01:23:45:67:89:ab
+unifi remembered-client-show 01:23:45:67:89:ab
 unifi dns-policies --limit 100
 unifi firewall-audit --format human
+unifi legacy-fallback-list port-profile
 unifi request /proxy/network/integration/v1/sites
 unifi request --method OPTIONS /proxy/network/integration/v1/sites
 ```

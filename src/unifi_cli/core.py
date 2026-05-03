@@ -18,6 +18,9 @@ from unifi_cli import __version__
 from unifi_cli.config import Config
 
 REDACTED = "***REDACTED***"
+OFFICIAL_API_BASE = "/proxy/network/integration/v1"
+LEGACY_API_BASE_TEMPLATE = "/proxy/network/api/s/{site}"
+LEGACY_V2_BASE_TEMPLATE = "/proxy/network/v2/api/site/{site}"
 SECRET_FIELD_NAMES = {
     "api_key",
     "apikey",
@@ -32,7 +35,7 @@ SECRET_FIELD_NAMES = {
     "x_iapp_key",
     "x_passphrase",
 }
-USER_EDITABLE_FIELDS = [
+LEGACY_CLIENT_EDITABLE_FIELDS = [
     "name",
     "note",
     "noted",
@@ -44,52 +47,155 @@ USER_EDITABLE_FIELDS = [
     "local_dns_record_enabled",
     "local_dns_record",
 ]
-RESOURCE_COLLECTIONS: dict[str, dict[str, Any]] = {
-    "dynamic-dns": {
-        "description": "Dynamic DNS configurations",
-        "lookup": ["_id", "name", "host_name", "hostname"],
-        "path": "dynamicdns",
-    },
-    "firewall-group": {
-        "description": "Legacy firewall groups",
-        "lookup": ["_id", "name"],
-        "path": "firewallgroup",
-    },
-    "firewall-rule": {
-        "description": "Legacy firewall rules",
-        "lookup": ["_id", "name"],
-        "path": "firewallrule",
-    },
-    "port-forward": {
-        "description": "Port forwarding rules",
-        "lookup": ["_id", "name"],
-        "path": "portforward",
-    },
-    "port-profile": {
-        "description": "Switch port profiles",
-        "lookup": ["_id", "name"],
-        "path": "portconf",
-    },
-    "radius-profile": {
-        "description": "RADIUS authentication profiles",
-        "lookup": ["_id", "name"],
-        "path": "radiusprofile",
-    },
-    "static-route": {
-        "description": "Static routes / routing entries",
-        "lookup": ["_id", "name", "static-route_network"],
-        "path": "routing",
-    },
-    "user-group": {
-        "description": "Bandwidth / QoS user groups",
-        "lookup": ["_id", "name"],
-        "path": "usergroup",
-    },
-    "wlan": {
-        "description": "Wireless networks / SSIDs",
-        "lookup": ["_id", "external_id", "name"],
-        "path": "wlanconf",
-    },
+UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class OfficialResource:
+    """An official UniFi Network API collection."""
+
+    name: str
+    collection: str
+    item_label: str
+    lookup_fields: tuple[str, ...]
+    supports_create: bool = False
+    supports_update: bool = False
+    supports_patch: bool = False
+    supports_delete: bool = False
+    supports_ordering: bool = False
+
+
+@dataclass(frozen=True)
+class LegacyResource:
+    """A legacy fallback collection kept only when the official API lacks coverage."""
+
+    description: str
+    path: str
+    lookup_fields: tuple[str, ...]
+
+
+OFFICIAL_RESOURCES: dict[str, OfficialResource] = {
+    "acl-rule": OfficialResource(
+        name="acl-rule",
+        collection="acl-rules",
+        item_label="aclRuleId",
+        lookup_fields=("id", "name"),
+        supports_create=True,
+        supports_update=True,
+        supports_delete=True,
+        supports_ordering=True,
+    ),
+    "client": OfficialResource(
+        name="client",
+        collection="clients",
+        item_label="clientId",
+        lookup_fields=("id", "name", "macAddress", "ipAddress"),
+    ),
+    "device": OfficialResource(
+        name="device",
+        collection="devices",
+        item_label="deviceId",
+        lookup_fields=("id", "name", "macAddress", "ipAddress"),
+    ),
+    "dns-policy": OfficialResource(
+        name="dns-policy",
+        collection="dns/policies",
+        item_label="dnsPolicyId",
+        lookup_fields=("id", "domain", "type"),
+        supports_create=True,
+        supports_update=True,
+        supports_delete=True,
+    ),
+    "firewall-policy": OfficialResource(
+        name="firewall-policy",
+        collection="firewall/policies",
+        item_label="firewallPolicyId",
+        lookup_fields=("id", "name"),
+        supports_create=True,
+        supports_update=True,
+        supports_patch=True,
+        supports_delete=True,
+        supports_ordering=True,
+    ),
+    "firewall-zone": OfficialResource(
+        name="firewall-zone",
+        collection="firewall/zones",
+        item_label="firewallZoneId",
+        lookup_fields=("id", "name"),
+        supports_create=True,
+        supports_update=True,
+        supports_delete=True,
+    ),
+    "network": OfficialResource(
+        name="network",
+        collection="networks",
+        item_label="networkId",
+        lookup_fields=("id", "name", "vlanId"),
+        supports_create=True,
+        supports_update=True,
+        supports_delete=True,
+    ),
+    "traffic-matching-list": OfficialResource(
+        name="traffic-matching-list",
+        collection="traffic-matching-lists",
+        item_label="trafficMatchingListId",
+        lookup_fields=("id", "name"),
+        supports_create=True,
+        supports_update=True,
+        supports_delete=True,
+    ),
+    "wifi-broadcast": OfficialResource(
+        name="wifi-broadcast",
+        collection="wifi/broadcasts",
+        item_label="wifiBroadcastId",
+        lookup_fields=("id", "name"),
+        supports_create=True,
+        supports_update=True,
+        supports_delete=True,
+    ),
+}
+
+LEGACY_RESOURCES: dict[str, LegacyResource] = {
+    "content-filtering": LegacyResource(
+        description="Content filtering profiles; not exposed by the official Network API docs.",
+        lookup_fields=("_id", "id", "name"),
+        path="/content-filtering",
+    ),
+    "dynamic-dns": LegacyResource(
+        description="Dynamic DNS configurations; no official Network API endpoint is documented.",
+        lookup_fields=("_id", "name", "host_name", "hostname"),
+        path="/rest/dynamicdns",
+    ),
+    "port-forward": LegacyResource(
+        description="Port forwarding rules; no official Network API endpoint is documented.",
+        lookup_fields=("_id", "name"),
+        path="/rest/portforward",
+    ),
+    "port-profile": LegacyResource(
+        description="Switch port profiles; official API exposes port actions but not profiles.",
+        lookup_fields=("_id", "name"),
+        path="/rest/portconf",
+    ),
+    "static-route": LegacyResource(
+        description="Static routes; no official Network API endpoint is documented.",
+        lookup_fields=("_id", "name", "static-route_network"),
+        path="/rest/routing",
+    ),
+    "traffic-route": LegacyResource(
+        description=(
+            "Traffic routes; official API exposes traffic matching lists, not this route set."
+        ),
+        lookup_fields=("_id", "id", "name"),
+        path="/trafficroutes",
+    ),
+    "user-group": LegacyResource(
+        description="Bandwidth / QoS user groups; no official Network API endpoint is documented.",
+        lookup_fields=("_id", "name"),
+        path="/rest/usergroup",
+    ),
 }
 
 
@@ -152,6 +258,17 @@ def parse_json_value(raw: str) -> Any:
         return raw
 
 
+def parse_data_json(raw: str) -> Any:
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise UniFiError(
+            "Invalid JSON supplied to --data-json.",
+            code="invalid_argument",
+            details={"error": str(error)},
+        ) from error
+
+
 def set_nested(target: dict[str, Any], dotted_key: str, value: Any) -> None:
     cursor: dict[str, Any] = target
     parts = dotted_key.split(".")
@@ -179,73 +296,67 @@ def count_collection(payload: Any) -> int:
     return 0
 
 
-def resource_config(resource: str) -> dict[str, Any]:
+def with_limit(args: argparse.Namespace) -> dict[str, Any]:
+    query: dict[str, Any] = {}
+    if getattr(args, "limit", None) is not None:
+        query["limit"] = args.limit
+    if getattr(args, "offset", None) is not None:
+        query["offset"] = args.offset
+    if getattr(args, "filter", None):
+        query["filter"] = args.filter
+    return query
+
+
+def parse_query_pairs(pairs: list[str]) -> dict[str, Any]:
+    query: dict[str, Any] = {}
+    for pair in pairs:
+        if "=" not in pair:
+            raise UniFiError(
+                f"Invalid query pair '{pair}'. Use KEY=VALUE.",
+                code="invalid_argument",
+            )
+        key, value = pair.split("=", 1)
+        query[key] = value
+    return query
+
+
+def normalise_record_type(record_type: str) -> str:
+    value = record_type.strip().upper()
+    if value == "A":
+        return "A_RECORD"
+    if value in {"CNAME", "A_RECORD"}:
+        return value
+    raise UniFiError(
+        "Unsupported DNS policy type.",
+        code="invalid_argument",
+        details={"supported": ["A", "A_RECORD", "CNAME"]},
+    )
+
+
+def official_resource(name: str) -> OfficialResource:
     try:
-        return RESOURCE_COLLECTIONS[resource]
+        return OFFICIAL_RESOURCES[name]
     except KeyError as error:
         raise UniFiError(
-            "Unknown resource "
-            f"'{resource}'. Valid values: {', '.join(sorted(RESOURCE_COLLECTIONS))}",
+            f"Unknown official resource '{name}'.",
             code="invalid_argument",
+            details={"valid": sorted(OFFICIAL_RESOURCES)},
         ) from error
 
 
-def lower_name(item: dict[str, Any]) -> str:
-    return str(item.get("name", "")).strip().lower()
-
-
-def infer_network_role(network: dict[str, Any]) -> str:
-    name = lower_name(network)
-    vlan = network.get("vlan")
-    if "iot" in name:
-        return "iot"
-    if "guest" in name or network.get("is_guest"):
-        return "guest"
-    if "manage" in name or vlan == 10:
-        return "management"
-    if "dmz" in name or vlan == 60:
-        return "dmz"
-    if "work" in name or vlan == 255:
-        return "work"
-    if "storage" in name or vlan == 20:
-        return "storage"
-    if "lab" in name or vlan == 30:
-        return "lab"
-    if "home" in name or vlan == 40:
-        return "home"
-    if name == "default":
-        return "default"
-    return "other"
-
-
-def zone_label_from_networks(networks: list[dict[str, Any]]) -> str:
-    purposes = {str(network.get("purpose", "")).lower() for network in networks}
-    roles = {infer_network_role(network) for network in networks}
-    if "wan" in purposes:
-        return "External"
-    if len(roles) > 1:
-        return "Shared LAN"
-    if "dmz" in roles:
-        return "DMZ"
-    if roles & {"default", "home", "iot", "lab", "management", "storage", "work"}:
-        return "Internal"
-    return "Unknown"
-
-
-def severity_score(severity: str) -> int:
-    return {"critical": 5, "warning": 2, "informational": 1}.get(severity, 0)
-
-
-def score_label(score: int) -> str:
-    if score >= 80:
-        return "healthy"
-    if score >= 60:
-        return "needs_attention"
-    return "critical"
+def legacy_resource(name: str) -> LegacyResource:
+    try:
+        return LEGACY_RESOURCES[name]
+    except KeyError as error:
+        raise UniFiError(
+            f"Unknown legacy fallback resource '{name}'.",
+            code="invalid_argument",
+            details={"valid": sorted(LEGACY_RESOURCES)},
+        ) from error
 
 
 class UniFiClient:
-    """Thin UniFi API client over the overlapping API surfaces."""
+    """Thin UniFi API client, with the official Network API as the primary surface."""
 
     def __init__(self, config: Config):
         self.config = config
@@ -321,19 +432,23 @@ class UniFiClient:
                 return {"raw": text}
         return {"raw": text}
 
-    def integration(self, method: str, suffix: str, **kwargs: Any) -> Any:
-        return self.request(method, f"/proxy/network/integration/v1{suffix}", **kwargs)
+    def official(self, method: str, suffix: str, **kwargs: Any) -> Any:
+        return self.request(method, f"{OFFICIAL_API_BASE}{suffix}", **kwargs)
 
     def legacy(self, method: str, suffix: str, **kwargs: Any) -> Any:
-        return self.request(method, f"/proxy/network/api/s/{self.config.site}{suffix}", **kwargs)
+        base = LEGACY_API_BASE_TEMPLATE.format(site=self.config.site)
+        return self.request(method, f"{base}{suffix}", **kwargs)
 
-    def v2(self, method: str, suffix: str, **kwargs: Any) -> Any:
-        return self.request(
-            method, f"/proxy/network/v2/api/site/{self.config.site}{suffix}", **kwargs
-        )
+    def legacy_v2(self, method: str, suffix: str, **kwargs: Any) -> Any:
+        base = LEGACY_V2_BASE_TEMPLATE.format(site=self.config.site)
+        return self.request(method, f"{base}{suffix}", **kwargs)
+
+    # Backwards-compatible alias used by older tests and callers.
+    def integration(self, method: str, suffix: str, **kwargs: Any) -> Any:
+        return self.official(method, suffix, **kwargs)
 
     def sites(self) -> list[dict[str, Any]]:
-        payload = self.integration("GET", "/sites")
+        payload = self.official("GET", "/sites")
         sites = extract_data(payload)
         if not isinstance(sites, list):
             raise UniFiError("Unexpected sites payload shape.", code="response_shape")
@@ -369,88 +484,135 @@ class UniFiClient:
             details={"hint": "Set UNIFI_SITE_ID or add site_id to ~/.config/unifi/config.toml."},
         )
 
-    def summary(self) -> dict[str, Any]:
-        site_id = self.site_id()
-        sites = self.sites()
-        devices = self.integration("GET", f"/sites/{site_id}/devices")
-        clients = self.integration("GET", f"/sites/{site_id}/clients")
-        networks = self.legacy("GET", "/rest/networkconf")
-        wlans = self.legacy("GET", "/rest/wlanconf")
-        static_dns = self.v2("GET", "/static-dns")
-        dns_policies = self.integration(
-            "GET", f"/sites/{site_id}/dns/policies", query={"limit": 200}
-        )
-        wans = self.integration("GET", f"/sites/{site_id}/wans")
-        firewall_zones = self.integration("GET", f"/sites/{site_id}/firewall/zones")
-        firewall_policies = self.v2("GET", "/firewall-policies")
-        traffic_routes = self.v2("GET", "/trafficroutes")
-        content_filtering = self.v2("GET", "/content-filtering")
-        port_profiles = self.legacy("GET", "/rest/portconf")
-        port_forwards = self.legacy("GET", "/rest/portforward")
-        static_routes = self.legacy("GET", "/rest/routing")
-        user_groups = self.legacy("GET", "/rest/usergroup")
-        radius_profiles = self.legacy("GET", "/rest/radiusprofile")
-        dynamic_dns = self.legacy("GET", "/rest/dynamicdns")
-        firewall_groups = self.legacy("GET", "/rest/firewallgroup")
-        firewall_rules = self.legacy("GET", "/rest/firewallrule")
+    def official_collection_path(self, resource: OfficialResource) -> str:
+        return f"/sites/{self.site_id()}/{resource.collection}"
 
-        network_list = extract_data(networks)
-        wlan_list = extract_data(wlans)
-        return {
-            "controller": self.config.base_url,
-            "counts": {
-                "clients": count_collection(clients),
-                "content_filtering_profiles": count_collection(content_filtering),
-                "devices": count_collection(devices),
-                "dns_policies": count_collection(dns_policies),
-                "dynamic_dns": count_collection(dynamic_dns),
-                "firewall_groups": count_collection(firewall_groups),
-                "firewall_policies": count_collection(firewall_policies),
-                "firewall_rules": count_collection(firewall_rules),
-                "firewall_zones": count_collection(firewall_zones),
-                "networks": count_collection(networks),
-                "port_forwards": count_collection(port_forwards),
-                "port_profiles": count_collection(port_profiles),
-                "radius_profiles": count_collection(radius_profiles),
-                "sites": len(sites),
-                "static_dns": count_collection(static_dns),
-                "static_routes": count_collection(static_routes),
-                "traffic_routes": count_collection(traffic_routes),
-                "user_groups": count_collection(user_groups),
-                "wans": count_collection(wans),
-                "wlans": count_collection(wlans),
-            },
-            "networks": [
-                {
-                    "dhcp_enabled": item.get("dhcpd_enabled"),
-                    "domain_name": item.get("domain_name"),
-                    "name": item.get("name"),
-                    "purpose": item.get("purpose"),
-                    "vlan": item.get("vlan"),
-                }
-                for item in network_list
-                if isinstance(item, dict)
-            ],
-            "site": self.config.site,
-            "site_id": site_id,
-            "wlans": [
-                {
-                    "enabled": item.get("enabled"),
-                    "name": item.get("name"),
-                    "networkconf_id": item.get("networkconf_id"),
-                    "security": item.get("security"),
-                }
-                for item in wlan_list
-                if isinstance(item, dict)
-            ],
-        }
+    def official_item_path(self, resource: OfficialResource, item_id: str) -> str:
+        return f"{self.official_collection_path(resource)}/{item_id}"
 
-    def find_client(self, selector: str) -> dict[str, Any]:
+    def legacy_fallback_path(self, resource: LegacyResource) -> tuple[str, bool]:
+        if resource.path.startswith("/rest/"):
+            return resource.path, False
+        return resource.path, True
+
+    def list_official(
+        self,
+        resource: str | OfficialResource,
+        *,
+        query: dict[str, Any] | None = None,
+    ) -> Any:
+        spec = official_resource(resource) if isinstance(resource, str) else resource
+        return self.official("GET", self.official_collection_path(spec), query=query)
+
+    def get_official(self, resource: str | OfficialResource, item_id: str) -> Any:
+        spec = official_resource(resource) if isinstance(resource, str) else resource
+        return self.official("GET", self.official_item_path(spec, item_id))
+
+    def find_official(
+        self,
+        resource: str | OfficialResource,
+        selector: str,
+        *,
+        record_type: str | None = None,
+    ) -> dict[str, Any]:
+        spec = official_resource(resource) if isinstance(resource, str) else resource
+        normalized = selector.strip().lower()
+
+        if UUID_RE.fullmatch(selector):
+            item = self.get_official(spec, selector)
+            if isinstance(item, dict):
+                return item
+            raise UniFiError("Unexpected item payload shape.", code="response_shape")
+
+        payload = self.list_official(spec, query={"limit": 500})
+        records = extract_data(payload)
+        if not isinstance(records, list):
+            raise UniFiError(
+                f"Unexpected payload shape for official resource '{spec.name}'.",
+                code="response_shape",
+            )
+
+        exact: list[dict[str, Any]] = []
+        partial: list[dict[str, Any]] = []
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            if record_type and str(record.get("type", "")).upper() != record_type.upper():
+                continue
+            values = [record.get(field) for field in spec.lookup_fields]
+            string_values = [str(value).lower() for value in values if value not in (None, "")]
+            if normalized in string_values:
+                exact.append(record)
+            elif any(normalized in value for value in string_values):
+                partial.append(record)
+
+        matches = exact or partial
+        if not matches:
+            raise UniFiError(f"No {spec.name} matched selector '{selector}'.", code="not_found")
+        if len(matches) > 1:
+            preview = [
+                {field: item.get(field) for field in spec.lookup_fields} for item in matches[:10]
+            ]
+            raise UniFiError(
+                f"Selector '{selector}' matched multiple {spec.name} entries.",
+                code="ambiguous_selector",
+                details={"matches": preview},
+            )
+        return matches[0]
+
+    def list_legacy_fallback(self, resource_name: str) -> Any:
+        spec = legacy_resource(resource_name)
+        suffix, use_v2 = self.legacy_fallback_path(spec)
+        if use_v2:
+            return self.legacy_v2("GET", suffix)
+        return self.legacy("GET", suffix)
+
+    def find_legacy_fallback(self, resource_name: str, selector: str) -> dict[str, Any]:
+        spec = legacy_resource(resource_name)
+        payload = self.list_legacy_fallback(resource_name)
+        records = extract_data(payload)
+        if not isinstance(records, list):
+            raise UniFiError(
+                f"Unexpected payload shape for legacy fallback resource '{resource_name}'.",
+                code="response_shape",
+            )
+
+        normalized = selector.strip().lower()
+        exact: list[dict[str, Any]] = []
+        partial: list[dict[str, Any]] = []
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            values = [record.get(field) for field in spec.lookup_fields]
+            string_values = [str(value).lower() for value in values if value not in (None, "")]
+            if normalized in string_values:
+                exact.append(record)
+            elif any(normalized in value for value in string_values):
+                partial.append(record)
+
+        matches = exact or partial
+        if not matches:
+            raise UniFiError(f"No {resource_name} matched selector '{selector}'.", code="not_found")
+        if len(matches) > 1:
+            preview = [
+                {field: item.get(field) for field in spec.lookup_fields} for item in matches[:10]
+            ]
+            raise UniFiError(
+                f"Selector '{selector}' matched multiple {resource_name} entries.",
+                code="ambiguous_selector",
+                details={"matches": preview},
+            )
+        return matches[0]
+
+    def remembered_clients(self) -> list[dict[str, Any]]:
         payload = self.legacy("GET", "/rest/user")
         clients = extract_data(payload)
         if not isinstance(clients, list):
-            raise UniFiError("Unexpected clients payload shape.", code="response_shape")
+            raise UniFiError("Unexpected remembered-client payload shape.", code="response_shape")
+        return clients
 
+    def find_remembered_client(self, selector: str) -> dict[str, Any]:
+        clients = self.remembered_clients()
         normalized = selector.strip().lower()
         exact: list[dict[str, Any]] = []
         partial: list[dict[str, Any]] = []
@@ -470,7 +632,10 @@ class UniFiClient:
 
         matches = exact or partial
         if not matches:
-            raise UniFiError(f"No client matched selector '{selector}'.", code="not_found")
+            raise UniFiError(
+                f"No remembered client matched selector '{selector}'.",
+                code="not_found",
+            )
         if len(matches) > 1:
             choices = [
                 {
@@ -483,130 +648,110 @@ class UniFiClient:
                 for item in matches[:10]
             ]
             raise UniFiError(
-                f"Selector '{selector}' matched multiple clients.",
+                f"Selector '{selector}' matched multiple remembered clients.",
                 code="ambiguous_selector",
                 details={"matches": choices},
             )
         return matches[0]
 
-    def find_network(self, selector: str) -> dict[str, Any]:
-        payload = self.legacy("GET", "/rest/networkconf")
-        networks = extract_data(payload)
-        if not isinstance(networks, list):
-            raise UniFiError("Unexpected networks payload shape.", code="response_shape")
-
-        normalized = selector.strip().lower()
-        matches = [
-            network
-            for network in networks
-            if normalized
-            in {
-                str(network.get("_id", "")).lower(),
-                str(network.get("external_id", "")).lower(),
-                str(network.get("name", "")).lower(),
-            }
-        ]
-        if not matches:
-            matches = [
-                network
-                for network in networks
-                if normalized in str(network.get("name", "")).lower()
-            ]
-        if not matches:
-            raise UniFiError(f"No network matched selector '{selector}'.", code="not_found")
-        if len(matches) > 1:
-            raise UniFiError(
-                "Network selector matched multiple networks.",
-                code="ambiguous_selector",
-                details={"matches": [item.get("name") for item in matches]},
-            )
-        return matches[0]
-
-    def find_static_dns(self, key: str, record_type: str | None = None) -> dict[str, Any]:
-        payload = self.v2("GET", "/static-dns")
-        records = extract_data(payload)
-        if not isinstance(records, list):
-            raise UniFiError("Unexpected static DNS payload shape.", code="response_shape")
-
-        normalized_key = key.strip().lower()
-        record_type_normalized = record_type.upper() if record_type else None
-        matches = []
-        for record in records:
-            same_key = (
-                str(record.get("_id", "")).lower() == normalized_key
-                or str(record.get("key", "")).lower() == normalized_key
-            )
-            same_type = (
-                record_type_normalized is None
-                or str(record.get("record_type", "")).upper() == record_type_normalized
-            )
-            if same_key and same_type:
-                matches.append(record)
-        if not matches:
-            raise UniFiError(f"No static DNS record matched '{key}'.", code="not_found")
-        if len(matches) > 1:
-            raise UniFiError(
-                "Static DNS selector matched multiple records.",
-                code="ambiguous_selector",
-                details={
-                    "matches": [
-                        {"key": item.get("key"), "record_type": item.get("record_type")}
-                        for item in matches
-                    ]
-                },
-            )
-        return matches[0]
-
-    def update_client(
+    def build_remembered_client_update(
         self, client: dict[str, Any], updates: dict[str, Any]
     ) -> tuple[str, dict[str, Any]]:
-        payload = {key: client[key] for key in USER_EDITABLE_FIELDS if key in client}
+        payload = {key: client[key] for key in LEGACY_CLIENT_EDITABLE_FIELDS if key in client}
         payload.update(updates)
         if payload.get("note"):
             payload["noted"] = True
         elif "note" in payload and not payload["note"]:
             payload["noted"] = bool(payload.get("noted", False))
-        path = f"/rest/user/{client['_id']}"
-        return path, payload
+        return f"/rest/user/{client['_id']}", payload
 
-    def list_resource(self, resource: str) -> Any:
-        config = resource_config(resource)
-        return self.legacy("GET", f"/rest/{config['path']}")
+    def summary(self) -> dict[str, Any]:
+        site_id = self.site_id()
+        app_info = self.official("GET", "/info")
+        sites = self.sites()
+        official_payloads = {
+            "acl_rules": self.official("GET", f"/sites/{site_id}/acl-rules", query={"limit": 500}),
+            "clients": self.official("GET", f"/sites/{site_id}/clients", query={"limit": 500}),
+            "devices": self.official("GET", f"/sites/{site_id}/devices", query={"limit": 500}),
+            "device_tags": self.official(
+                "GET", f"/sites/{site_id}/device-tags", query={"limit": 500}
+            ),
+            "dns_policies": self.official(
+                "GET", f"/sites/{site_id}/dns/policies", query={"limit": 500}
+            ),
+            "firewall_policies": self.official(
+                "GET", f"/sites/{site_id}/firewall/policies", query={"limit": 500}
+            ),
+            "firewall_zones": self.official(
+                "GET", f"/sites/{site_id}/firewall/zones", query={"limit": 500}
+            ),
+            "networks": self.official("GET", f"/sites/{site_id}/networks", query={"limit": 500}),
+            "radius_profiles": self.official(
+                "GET", f"/sites/{site_id}/radius/profiles", query={"limit": 500}
+            ),
+            "traffic_matching_lists": self.official(
+                "GET", f"/sites/{site_id}/traffic-matching-lists", query={"limit": 500}
+            ),
+            "vpn_servers": self.official(
+                "GET", f"/sites/{site_id}/vpn/servers", query={"limit": 500}
+            ),
+            "site_to_site_vpns": self.official(
+                "GET", f"/sites/{site_id}/vpn/site-to-site-tunnels", query={"limit": 500}
+            ),
+            "wans": self.official("GET", f"/sites/{site_id}/wans", query={"limit": 500}),
+            "wifi_broadcasts": self.official(
+                "GET", f"/sites/{site_id}/wifi/broadcasts", query={"limit": 500}
+            ),
+        }
+        networks = extract_data(official_payloads["networks"])
+        wifi_broadcasts = extract_data(official_payloads["wifi_broadcasts"])
+        fallback_counts: dict[str, int] = {}
+        for name in ["port-profile", "port-forward", "static-route", "traffic-route"]:
+            try:
+                fallback_counts[name.replace("-", "_")] = count_collection(
+                    self.list_legacy_fallback(name)
+                )
+            except UniFiError as error:
+                fallback_counts[name.replace("-", "_")] = -1
+                fallback_counts[f"{name.replace('-', '_')}_error"] = error.code  # type: ignore[assignment]
 
-    def find_resource(self, resource: str, selector: str) -> dict[str, Any]:
-        config = resource_config(resource)
-        payload = self.list_resource(resource)
-        records = extract_data(payload)
-        if not isinstance(records, list):
-            raise UniFiError(
-                f"Unexpected payload shape for resource '{resource}'.",
-                code="response_shape",
-            )
-
-        normalized = selector.strip().lower()
-        exact: list[dict[str, Any]] = []
-        partial: list[dict[str, Any]] = []
-        lookup_fields = config.get("lookup", [])
-
-        for record in records:
-            values = [record.get(field) for field in lookup_fields]
-            string_values = [str(value).lower() for value in values if value not in (None, "")]
-            if normalized in string_values:
-                exact.append(record)
-            elif any(normalized in value for value in string_values):
-                partial.append(record)
-
-        matches = exact or partial
-        if not matches:
-            raise UniFiError(f"No {resource} matched selector '{selector}'.", code="not_found")
-        if len(matches) > 1:
-            preview = [{field: item.get(field) for field in lookup_fields} for item in matches[:10]]
-            raise UniFiError(
-                f"Selector '{selector}' matched multiple {resource} entries.",
-                code="ambiguous_selector",
-                details={"matches": preview},
-            )
-        return matches[0]
+        return {
+            "api": {
+                "application_version": app_info.get("applicationVersion")
+                if isinstance(app_info, dict)
+                else None,
+                "primary_surface": "official_network_integration_v1",
+            },
+            "controller": self.config.base_url,
+            "counts": {
+                **{key: count_collection(value) for key, value in official_payloads.items()},
+                "sites": len(sites),
+            },
+            "fallback_counts": fallback_counts,
+            "networks": [
+                {
+                    "enabled": item.get("enabled"),
+                    "hostIpAddress": item.get("ipv4Configuration", {}).get("hostIpAddress"),
+                    "name": item.get("name"),
+                    "vlanId": item.get("vlanId"),
+                    "zoneId": item.get("zoneId"),
+                }
+                for item in networks
+                if isinstance(item, dict)
+            ],
+            "site": self.config.site,
+            "site_id": site_id,
+            "wifi_broadcasts": [
+                {
+                    "enabled": item.get("enabled"),
+                    "name": item.get("name"),
+                    "network": item.get("network"),
+                    "type": item.get("type"),
+                }
+                for item in wifi_broadcasts
+                if isinstance(item, dict)
+            ],
+        }
 
 
 def add_write_guard(parser: argparse.ArgumentParser) -> None:
@@ -625,6 +770,12 @@ def add_query_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_list_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--limit", type=int, default=200)
+    parser.add_argument("--offset", type=int)
+    parser.add_argument("--filter", help="official API filter string")
+
+
 def require_confirmation(args: argparse.Namespace, method: str, path: str, payload: Any) -> None:
     if args.yes:
         return
@@ -636,6 +787,25 @@ def require_confirmation(args: argparse.Namespace, method: str, path: str, paylo
             "request": {"method": method.upper(), "path": path, "payload": payload},
         },
     )
+
+
+def require_capability(spec: OfficialResource, capability: str) -> None:
+    attr = f"supports_{capability}"
+    if not bool(getattr(spec, attr)):
+        raise UniFiError(
+            f"The official {spec.name} resource does not support {capability}.",
+            code="unsupported_operation",
+        )
+
+
+def official_dry_run_path(client: UniFiClient, suffix: str) -> str:
+    return f"{OFFICIAL_API_BASE}{suffix}"
+
+
+def legacy_dry_run_path(client: UniFiClient, suffix: str, *, v2: bool = False) -> str:
+    if v2:
+        return f"{LEGACY_V2_BASE_TEMPLATE.format(site=client.config.site)}{suffix}"
+    return f"{LEGACY_API_BASE_TEMPLATE.format(site=client.config.site)}{suffix}"
 
 
 def doctor(config: Config) -> tuple[dict[str, Any], bool]:
@@ -682,7 +852,11 @@ def doctor(config: Config) -> tuple[dict[str, Any], bool]:
         live["attempted"] = True
         try:
             client = UniFiClient(config)
+            app_info = client.official("GET", "/info")
             sites = client.sites()
+            live["application_version"] = (
+                app_info.get("applicationVersion") if isinstance(app_info, dict) else None
+            )
             live["ok"] = True
             live["site_count"] = len(sites)
             try:
@@ -725,9 +899,11 @@ def format_doctor_human(report: dict[str, Any]) -> str:
 
     live = report["live_check"]
     if live["attempted"] and live.get("ok"):
+        version = live.get("application_version") or "unknown"
         lines.append(
             f"Live check: ok ({live['site_count']} site{'s' if live['site_count'] != 1 else ''})"
         )
+        lines.append(f"Network application version: {version}")
         if live.get("resolved_site_id"):
             lines.append(f"Resolved site ID: {live['resolved_site_id']}")
         elif live.get("resolved_site_id_error"):
@@ -739,6 +915,10 @@ def format_doctor_human(report: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def command_app_info(client: UniFiClient, _args: argparse.Namespace) -> Any:
+    return client.official("GET", "/info")
+
+
 def command_summary(client: UniFiClient, _args: argparse.Namespace) -> Any:
     return client.summary()
 
@@ -747,80 +927,49 @@ def command_sites(client: UniFiClient, _args: argparse.Namespace) -> Any:
     return client.sites()
 
 
-def command_devices(client: UniFiClient, _args: argparse.Namespace) -> Any:
-    return client.integration("GET", f"/sites/{client.site_id()}/devices")
+def command_official_list(
+    client: UniFiClient,
+    args: argparse.Namespace,
+    resource_name: str,
+) -> Any:
+    return client.list_official(resource_name, query=with_limit(args))
 
 
-def command_clients(client: UniFiClient, args: argparse.Namespace) -> Any:
-    if args.online:
-        return client.legacy("GET", "/stat/sta")
-    return client.legacy("GET", "/rest/user")
+def command_official_show(
+    client: UniFiClient,
+    args: argparse.Namespace,
+    resource_name: str,
+) -> Any:
+    return client.find_official(resource_name, args.selector)
 
 
-def command_client_show(client: UniFiClient, args: argparse.Namespace) -> Any:
-    return client.find_client(args.selector)
+def command_official_create(
+    client: UniFiClient,
+    args: argparse.Namespace,
+    resource_name: str,
+) -> Any:
+    spec = official_resource(resource_name)
+    require_capability(spec, "create")
+    payload = parse_data_json(args.data_json)
+    suffix = client.official_collection_path(spec)
+    require_confirmation(args, "POST", official_dry_run_path(client, suffix), payload)
+    return client.official("POST", suffix, payload=payload)
 
 
-def command_reservation_set(client: UniFiClient, args: argparse.Namespace) -> Any:
-    client_obj = client.find_client(args.selector)
-    path, payload = client.update_client(
-        client_obj,
-        {
-            "use_fixedip": True,
-            "fixed_ip": args.ip,
-            **({"network_id": args.network_id} if args.network_id else {}),
-        },
-    )
-    require_confirmation(args, "PUT", f"/proxy/network/api/s/{client.config.site}{path}", payload)
-    return client.legacy("PUT", path, payload=payload)
-
-
-def command_reservation_clear(client: UniFiClient, args: argparse.Namespace) -> Any:
-    client_obj = client.find_client(args.selector)
-    path, payload = client.update_client(client_obj, {"fixed_ip": "", "use_fixedip": False})
-    require_confirmation(args, "PUT", f"/proxy/network/api/s/{client.config.site}{path}", payload)
-    return client.legacy("PUT", path, payload=payload)
-
-
-def command_local_dns_set(client: UniFiClient, args: argparse.Namespace) -> Any:
-    client_obj = client.find_client(args.selector)
-    path, payload = client.update_client(
-        client_obj,
-        {"local_dns_record": args.record, "local_dns_record_enabled": True},
-    )
-    require_confirmation(args, "PUT", f"/proxy/network/api/s/{client.config.site}{path}", payload)
-    return client.legacy("PUT", path, payload=payload)
-
-
-def command_local_dns_clear(client: UniFiClient, args: argparse.Namespace) -> Any:
-    client_obj = client.find_client(args.selector)
-    path, payload = client.update_client(
-        client_obj,
-        {"local_dns_record": "", "local_dns_record_enabled": False},
-    )
-    require_confirmation(args, "PUT", f"/proxy/network/api/s/{client.config.site}{path}", payload)
-    return client.legacy("PUT", path, payload=payload)
-
-
-def command_client_forget(client: UniFiClient, args: argparse.Namespace) -> Any:
-    client_obj = client.find_client(args.selector)
-    payload = {"cmd": "forget-sta", "macs": [client_obj["mac"]]}
-    path = f"/proxy/network/api/s/{client.config.site}/cmd/stamgr"
-    require_confirmation(args, "POST", path, payload)
-    return client.legacy("POST", "/cmd/stamgr", payload=payload)
-
-
-def command_networks(client: UniFiClient, _args: argparse.Namespace) -> Any:
-    return client.legacy("GET", "/rest/networkconf")
-
-
-def command_network_show(client: UniFiClient, args: argparse.Namespace) -> Any:
-    return client.find_network(args.selector)
-
-
-def command_network_merge(client: UniFiClient, args: argparse.Namespace) -> Any:
-    network = client.find_network(args.selector)
-    merged = copy.deepcopy(network)
+def command_official_merge(
+    client: UniFiClient,
+    args: argparse.Namespace,
+    resource_name: str,
+) -> Any:
+    spec = official_resource(resource_name)
+    require_capability(spec, "update")
+    current = client.find_official(spec, args.selector)
+    merged = copy.deepcopy(current)
+    if args.data_json:
+        data = parse_data_json(args.data_json)
+        if not isinstance(data, dict):
+            raise UniFiError("--data-json must be a JSON object.", code="invalid_argument")
+        merged.update(data)
     for assignment in args.set or []:
         if "=" not in assignment:
             raise UniFiError(
@@ -829,153 +978,464 @@ def command_network_merge(client: UniFiClient, args: argparse.Namespace) -> Any:
             )
         key, raw_value = assignment.split("=", 1)
         set_nested(merged, key, parse_json_value(raw_value))
-    path = f"/rest/networkconf/{network['_id']}"
-    require_confirmation(args, "PUT", f"/proxy/network/api/s/{client.config.site}{path}", merged)
-    return client.legacy("PUT", path, payload=merged)
+    item_id = str(current["id"])
+    suffix = client.official_item_path(spec, item_id)
+    require_confirmation(args, "PUT", official_dry_run_path(client, suffix), merged)
+    return client.official("PUT", suffix, payload=merged)
 
 
-def command_wlans(client: UniFiClient, _args: argparse.Namespace) -> Any:
-    return client.legacy("GET", "/rest/wlanconf")
+def command_official_patch(
+    client: UniFiClient,
+    args: argparse.Namespace,
+    resource_name: str,
+) -> Any:
+    spec = official_resource(resource_name)
+    require_capability(spec, "patch")
+    current = client.find_official(spec, args.selector)
+    payload = parse_data_json(args.data_json)
+    suffix = client.official_item_path(spec, str(current["id"]))
+    require_confirmation(args, "PATCH", official_dry_run_path(client, suffix), payload)
+    return client.official("PATCH", suffix, payload=payload)
 
 
-def command_wans(client: UniFiClient, _args: argparse.Namespace) -> Any:
-    return client.integration("GET", f"/sites/{client.site_id()}/wans")
+def command_official_delete(
+    client: UniFiClient,
+    args: argparse.Namespace,
+    resource_name: str,
+) -> Any:
+    spec = official_resource(resource_name)
+    require_capability(spec, "delete")
+    current = client.find_official(spec, args.selector)
+    suffix = client.official_item_path(spec, str(current["id"]))
+    require_confirmation(args, "DELETE", official_dry_run_path(client, suffix), current)
+    return client.official("DELETE", suffix)
 
 
-def command_dns_static(client: UniFiClient, _args: argparse.Namespace) -> Any:
-    return client.v2("GET", "/static-dns")
+def command_official_ordering(
+    client: UniFiClient,
+    _args: argparse.Namespace,
+    resource_name: str,
+) -> Any:
+    spec = official_resource(resource_name)
+    require_capability(spec, "ordering")
+    suffix = f"{client.official_collection_path(spec)}/ordering"
+    return client.official("GET", suffix)
+
+
+def command_official_reorder(
+    client: UniFiClient,
+    args: argparse.Namespace,
+    resource_name: str,
+) -> Any:
+    spec = official_resource(resource_name)
+    require_capability(spec, "ordering")
+    payload = parse_data_json(args.data_json)
+    suffix = f"{client.official_collection_path(spec)}/ordering"
+    require_confirmation(args, "PUT", official_dry_run_path(client, suffix), payload)
+    return client.official("PUT", suffix, payload=payload)
+
+
+def command_devices(client: UniFiClient, args: argparse.Namespace) -> Any:
+    return command_official_list(client, args, "device")
+
+
+def command_device_show(client: UniFiClient, args: argparse.Namespace) -> Any:
+    return command_official_show(client, args, "device")
+
+
+def command_device_statistics(client: UniFiClient, args: argparse.Namespace) -> Any:
+    device = client.find_official("device", args.selector)
+    suffix = f"/sites/{client.site_id()}/devices/{device['id']}/statistics/latest"
+    return client.official("GET", suffix)
+
+
+def command_device_action(client: UniFiClient, args: argparse.Namespace) -> Any:
+    device = client.find_official("device", args.selector)
+    payload = parse_data_json(args.data_json) if args.data_json else {"action": args.action}
+    suffix = f"/sites/{client.site_id()}/devices/{device['id']}/actions"
+    require_confirmation(args, "POST", official_dry_run_path(client, suffix), payload)
+    return client.official("POST", suffix, payload=payload)
+
+
+def command_port_action(client: UniFiClient, args: argparse.Namespace) -> Any:
+    device = client.find_official("device", args.selector)
+    payload = parse_data_json(args.data_json) if args.data_json else {"action": args.action}
+    suffix = (
+        f"/sites/{client.site_id()}/devices/{device['id']}/interfaces/ports/{args.port}/actions"
+    )
+    require_confirmation(args, "POST", official_dry_run_path(client, suffix), payload)
+    return client.official("POST", suffix, payload=payload)
+
+
+def command_clients(client: UniFiClient, args: argparse.Namespace) -> Any:
+    return client.official("GET", f"/sites/{client.site_id()}/clients", query=with_limit(args))
+
+
+def command_client_show(client: UniFiClient, args: argparse.Namespace) -> Any:
+    client_obj = client.find_official("client", args.selector)
+    suffix = f"/sites/{client.site_id()}/clients/{client_obj['id']}"
+    return client.official("GET", suffix)
+
+
+def command_client_action(client: UniFiClient, args: argparse.Namespace) -> Any:
+    client_obj = client.find_official("client", args.selector)
+    payload = parse_data_json(args.data_json) if args.data_json else {"action": args.action}
+    suffix = f"/sites/{client.site_id()}/clients/{client_obj['id']}/actions"
+    require_confirmation(args, "POST", official_dry_run_path(client, suffix), payload)
+    return client.official("POST", suffix, payload=payload)
+
+
+def command_remembered_clients(client: UniFiClient, _args: argparse.Namespace) -> Any:
+    return client.remembered_clients()
+
+
+def command_remembered_client_show(client: UniFiClient, args: argparse.Namespace) -> Any:
+    return client.find_remembered_client(args.selector)
+
+
+def command_reservation_set(client: UniFiClient, args: argparse.Namespace) -> Any:
+    client_obj = client.find_remembered_client(args.selector)
+    path, payload = client.build_remembered_client_update(
+        client_obj,
+        {
+            "use_fixedip": True,
+            "fixed_ip": args.ip,
+            **({"network_id": args.network_id} if args.network_id else {}),
+        },
+    )
+    require_confirmation(args, "PUT", legacy_dry_run_path(client, path), payload)
+    return client.legacy("PUT", path, payload=payload)
+
+
+def command_reservation_clear(client: UniFiClient, args: argparse.Namespace) -> Any:
+    client_obj = client.find_remembered_client(args.selector)
+    path, payload = client.build_remembered_client_update(
+        client_obj, {"fixed_ip": "", "use_fixedip": False}
+    )
+    require_confirmation(args, "PUT", legacy_dry_run_path(client, path), payload)
+    return client.legacy("PUT", path, payload=payload)
+
+
+def command_local_dns_set(client: UniFiClient, args: argparse.Namespace) -> Any:
+    client_obj = client.find_remembered_client(args.selector)
+    path, payload = client.build_remembered_client_update(
+        client_obj,
+        {"local_dns_record": args.record, "local_dns_record_enabled": True},
+    )
+    require_confirmation(args, "PUT", legacy_dry_run_path(client, path), payload)
+    return client.legacy("PUT", path, payload=payload)
+
+
+def command_local_dns_clear(client: UniFiClient, args: argparse.Namespace) -> Any:
+    client_obj = client.find_remembered_client(args.selector)
+    path, payload = client.build_remembered_client_update(
+        client_obj,
+        {"local_dns_record": "", "local_dns_record_enabled": False},
+    )
+    require_confirmation(args, "PUT", legacy_dry_run_path(client, path), payload)
+    return client.legacy("PUT", path, payload=payload)
+
+
+def command_client_forget(client: UniFiClient, args: argparse.Namespace) -> Any:
+    client_obj = client.find_remembered_client(args.selector)
+    payload = {"cmd": "forget-sta", "macs": [client_obj["mac"]]}
+    path = "/cmd/stamgr"
+    require_confirmation(args, "POST", legacy_dry_run_path(client, path), payload)
+    return client.legacy("POST", path, payload=payload)
+
+
+def command_networks(client: UniFiClient, args: argparse.Namespace) -> Any:
+    return command_official_list(client, args, "network")
+
+
+def command_network_show(client: UniFiClient, args: argparse.Namespace) -> Any:
+    return command_official_show(client, args, "network")
+
+
+def command_network_references(client: UniFiClient, args: argparse.Namespace) -> Any:
+    network = client.find_official("network", args.selector)
+    suffix = f"/sites/{client.site_id()}/networks/{network['id']}/references"
+    return client.official("GET", suffix)
+
+
+def command_wifi_broadcasts(client: UniFiClient, args: argparse.Namespace) -> Any:
+    return command_official_list(client, args, "wifi-broadcast")
+
+
+def command_wifi_broadcast_show(client: UniFiClient, args: argparse.Namespace) -> Any:
+    return command_official_show(client, args, "wifi-broadcast")
 
 
 def command_dns_policies(client: UniFiClient, args: argparse.Namespace) -> Any:
-    query = {"limit": args.limit}
-    if args.filter:
-        query["filter"] = args.filter
-    return client.integration("GET", f"/sites/{client.site_id()}/dns/policies", query=query)
+    return command_official_list(client, args, "dns-policy")
 
 
-def build_dns_payload(args: argparse.Namespace) -> dict[str, Any]:
+def command_dns_policy_show(client: UniFiClient, args: argparse.Namespace) -> Any:
+    record_type = normalise_record_type(args.record_type) if args.record_type else None
+    return client.find_official("dns-policy", args.selector, record_type=record_type)
+
+
+def build_dns_policy_payload(args: argparse.Namespace) -> dict[str, Any]:
+    record_type = normalise_record_type(args.record_type)
+    domain = args.domain or args.key
+    if not domain:
+        raise UniFiError("DNS policy requires --domain.", code="invalid_argument")
+
     payload: dict[str, Any] = {
+        "domain": domain,
         "enabled": not args.disabled,
-        "key": args.key,
-        "record_type": args.record_type.upper(),
-        "ttl": args.ttl,
-        "value": args.value,
+        "ttlSeconds": args.ttl,
+        "type": record_type,
     }
-    if args.priority is not None:
-        payload["priority"] = args.priority
-    if args.weight is not None:
-        payload["weight"] = args.weight
-    if args.port is not None:
-        payload["port"] = args.port
+    if record_type == "A_RECORD":
+        payload["ipv4Address"] = args.value
+    elif record_type == "CNAME":
+        payload["cname"] = args.value
     return payload
 
 
 def command_dns_upsert(client: UniFiClient, args: argparse.Namespace) -> Any:
-    payload = build_dns_payload(args)
+    payload = build_dns_policy_payload(args)
+    record_type = str(payload["type"])
+    domain = str(payload["domain"])
     try:
-        current = client.find_static_dns(args.key, args.record_type)
+        current = client.find_official("dns-policy", domain, record_type=record_type)
     except UniFiError as error:
         if error.code != "not_found":
             raise
         current = None
 
+    spec = official_resource("dns-policy")
     if current is None:
-        path = f"/proxy/network/v2/api/site/{client.config.site}/static-dns"
-        require_confirmation(args, "POST", path, payload)
-        return client.v2("POST", "/static-dns", payload=payload)
+        suffix = client.official_collection_path(spec)
+        require_confirmation(args, "POST", official_dry_run_path(client, suffix), payload)
+        return client.official("POST", suffix, payload=payload)
 
     merged = dict(current)
     merged.update(payload)
-    path = f"/proxy/network/v2/api/site/{client.config.site}/static-dns/{current['_id']}"
-    require_confirmation(args, "PUT", path, merged)
-    return client.v2("PUT", f"/static-dns/{current['_id']}", payload=merged)
+    suffix = client.official_item_path(spec, str(current["id"]))
+    require_confirmation(args, "PUT", official_dry_run_path(client, suffix), merged)
+    return client.official("PUT", suffix, payload=merged)
 
 
 def command_dns_delete(client: UniFiClient, args: argparse.Namespace) -> Any:
-    record = client.find_static_dns(args.selector, args.record_type)
-    path = f"/proxy/network/v2/api/site/{client.config.site}/static-dns/{record['_id']}"
-    require_confirmation(args, "DELETE", path, {"record": record})
-    return client.v2("DELETE", f"/static-dns/{record['_id']}")
+    record_type = normalise_record_type(args.record_type) if args.record_type else None
+    record = client.find_official("dns-policy", args.selector, record_type=record_type)
+    spec = official_resource("dns-policy")
+    suffix = client.official_item_path(spec, str(record["id"]))
+    require_confirmation(args, "DELETE", official_dry_run_path(client, suffix), record)
+    return client.official("DELETE", suffix)
 
 
-def command_firewall_zones(client: UniFiClient, _args: argparse.Namespace) -> Any:
-    return client.integration("GET", f"/sites/{client.site_id()}/firewall/zones")
+def command_firewall_zones(client: UniFiClient, args: argparse.Namespace) -> Any:
+    return command_official_list(client, args, "firewall-zone")
 
 
-def command_firewall_policies(client: UniFiClient, _args: argparse.Namespace) -> Any:
-    return client.v2("GET", "/firewall-policies")
+def command_firewall_policies(client: UniFiClient, args: argparse.Namespace) -> Any:
+    return command_official_list(client, args, "firewall-policy")
 
 
-def command_traffic_routes(client: UniFiClient, _args: argparse.Namespace) -> Any:
-    return client.v2("GET", "/trafficroutes")
+def command_acl_rules(client: UniFiClient, args: argparse.Namespace) -> Any:
+    return command_official_list(client, args, "acl-rule")
 
 
-def command_content_filtering(client: UniFiClient, _args: argparse.Namespace) -> Any:
-    return client.v2("GET", "/content-filtering")
+def command_traffic_matching_lists(client: UniFiClient, args: argparse.Namespace) -> Any:
+    return command_official_list(client, args, "traffic-matching-list")
+
+
+def command_wans(client: UniFiClient, args: argparse.Namespace) -> Any:
+    return client.official("GET", f"/sites/{client.site_id()}/wans", query=with_limit(args))
+
+
+def command_radius_profiles(client: UniFiClient, args: argparse.Namespace) -> Any:
+    return client.official(
+        "GET", f"/sites/{client.site_id()}/radius/profiles", query=with_limit(args)
+    )
+
+
+def command_device_tags(client: UniFiClient, args: argparse.Namespace) -> Any:
+    return client.official("GET", f"/sites/{client.site_id()}/device-tags", query=with_limit(args))
+
+
+def command_vpn_servers(client: UniFiClient, args: argparse.Namespace) -> Any:
+    return client.official("GET", f"/sites/{client.site_id()}/vpn/servers", query=with_limit(args))
+
+
+def command_site_to_site_vpns(client: UniFiClient, args: argparse.Namespace) -> Any:
+    return client.official(
+        "GET", f"/sites/{client.site_id()}/vpn/site-to-site-tunnels", query=with_limit(args)
+    )
+
+
+def command_vouchers(client: UniFiClient, args: argparse.Namespace) -> Any:
+    return client.official(
+        "GET", f"/sites/{client.site_id()}/hotspot/vouchers", query=with_limit(args)
+    )
+
+
+def command_voucher_show(client: UniFiClient, args: argparse.Namespace) -> Any:
+    suffix = f"/sites/{client.site_id()}/hotspot/vouchers/{args.selector}"
+    return client.official("GET", suffix)
+
+
+def command_vouchers_generate(client: UniFiClient, args: argparse.Namespace) -> Any:
+    payload = parse_data_json(args.data_json)
+    suffix = f"/sites/{client.site_id()}/hotspot/vouchers"
+    require_confirmation(args, "POST", official_dry_run_path(client, suffix), payload)
+    return client.official("POST", suffix, payload=payload)
+
+
+def command_voucher_delete(client: UniFiClient, args: argparse.Namespace) -> Any:
+    suffix = f"/sites/{client.site_id()}/hotspot/vouchers/{args.selector}"
+    require_confirmation(args, "DELETE", official_dry_run_path(client, suffix), {})
+    return client.official("DELETE", suffix)
+
+
+def command_legacy_fallback_types(_client: UniFiClient, _args: argparse.Namespace) -> Any:
+    return {
+        name: {
+            "description": spec.description,
+            "lookup": list(spec.lookup_fields),
+            "path": spec.path,
+        }
+        for name, spec in sorted(LEGACY_RESOURCES.items())
+    }
+
+
+def command_legacy_fallback_list(client: UniFiClient, args: argparse.Namespace) -> Any:
+    return client.list_legacy_fallback(args.resource)
+
+
+def command_legacy_fallback_show(client: UniFiClient, args: argparse.Namespace) -> Any:
+    return client.find_legacy_fallback(args.resource, args.selector)
+
+
+def command_legacy_fallback_merge(client: UniFiClient, args: argparse.Namespace) -> Any:
+    spec = legacy_resource(args.resource)
+    current = client.find_legacy_fallback(args.resource, args.selector)
+    merged = copy.deepcopy(current)
+    if args.data_json:
+        data = parse_data_json(args.data_json)
+        if not isinstance(data, dict):
+            raise UniFiError("--data-json must be a JSON object.", code="invalid_argument")
+        merged.update(data)
+    for assignment in args.set or []:
+        if "=" not in assignment:
+            raise UniFiError(
+                f"Invalid --set value '{assignment}'. Use dotted.key=value.",
+                code="invalid_argument",
+            )
+        key, raw_value = assignment.split("=", 1)
+        set_nested(merged, key, parse_json_value(raw_value))
+
+    item_id = str(current.get("_id") or current.get("id"))
+    if not item_id:
+        raise UniFiError("Legacy fallback object has no usable id.", code="response_shape")
+    suffix, use_v2 = client.legacy_fallback_path(spec)
+    path = f"{suffix}/{item_id}"
+    require_confirmation(args, "PUT", legacy_dry_run_path(client, path, v2=use_v2), merged)
+    if use_v2:
+        return client.legacy_v2("PUT", path, payload=merged)
+    return client.legacy("PUT", path, payload=merged)
+
+
+def command_legacy_fallback_delete(client: UniFiClient, args: argparse.Namespace) -> Any:
+    spec = legacy_resource(args.resource)
+    current = client.find_legacy_fallback(args.resource, args.selector)
+    item_id = str(current.get("_id") or current.get("id"))
+    if not item_id:
+        raise UniFiError("Legacy fallback object has no usable id.", code="response_shape")
+    suffix, use_v2 = client.legacy_fallback_path(spec)
+    path = f"{suffix}/{item_id}"
+    require_confirmation(args, "DELETE", legacy_dry_run_path(client, path, v2=use_v2), current)
+    if use_v2:
+        return client.legacy_v2("DELETE", path)
+    return client.legacy("DELETE", path)
+
+
+def network_role(network: dict[str, Any]) -> str:
+    name = str(network.get("name", "")).lower()
+    vlan = network.get("vlanId")
+    if "management" in name or vlan == 10:
+        return "management"
+    if "storage" in name or vlan == 20:
+        return "storage"
+    if "lab" in name or vlan == 30:
+        return "lab"
+    if "home" in name or vlan == 40:
+        return "home"
+    if "iot" in name or vlan == 50:
+        return "iot"
+    if "dmz" in name or vlan == 60:
+        return "dmz"
+    if "work" in name or vlan == 255:
+        return "work"
+    if name == "default" or vlan == 1:
+        return "default"
+    return "other"
+
+
+def policy_is_user_defined(policy: dict[str, Any]) -> bool:
+    metadata = policy.get("metadata")
+    if isinstance(metadata, dict):
+        return metadata.get("origin") == "USER_DEFINED"
+    return bool(policy.get("predefined") is False)
+
+
+def severity_score(severity: str) -> int:
+    return {"critical": 5, "warning": 2, "informational": 1}.get(severity, 0)
+
+
+def score_label(score: int) -> str:
+    if score >= 80:
+        return "healthy"
+    if score >= 60:
+        return "needs_attention"
+    return "critical"
 
 
 def build_firewall_audit_report(client: UniFiClient) -> dict[str, Any]:
-    networks_payload = client.legacy("GET", "/rest/networkconf")
+    site_id = client.site_id()
+    networks_payload = client.official("GET", f"/sites/{site_id}/networks", query={"limit": 500})
+    policies_payload = client.official(
+        "GET", f"/sites/{site_id}/firewall/policies", query={"limit": 500}
+    )
+    zones_payload = client.official("GET", f"/sites/{site_id}/firewall/zones", query={"limit": 500})
+    devices_payload = client.official("GET", f"/sites/{site_id}/devices", query={"limit": 500})
+    acl_payload = client.official("GET", f"/sites/{site_id}/acl-rules", query={"limit": 500})
+
     networks = extract_data(networks_payload)
-    if not isinstance(networks, list):
-        raise UniFiError(
-            "Unexpected network payload shape while building firewall audit.", code="response_shape"
-        )
-
-    firewall_policies = client.v2("GET", "/firewall-policies")
-    if not isinstance(firewall_policies, list):
-        raise UniFiError(
-            "Unexpected firewall policy payload shape while building firewall audit.",
-            code="response_shape",
-        )
-
-    devices_payload = client.integration("GET", f"/sites/{client.site_id()}/devices")
+    policies = extract_data(policies_payload)
+    zones = extract_data(zones_payload)
     devices = extract_data(devices_payload)
+    acl_rules = extract_data(acl_payload)
+    if not isinstance(networks, list) or not isinstance(policies, list):
+        raise UniFiError("Unexpected official firewall audit payload shape.", code="response_shape")
+    if not isinstance(zones, list):
+        zones = []
     if not isinstance(devices, list):
-        raise UniFiError(
-            "Unexpected devices payload shape while building firewall audit.", code="response_shape"
-        )
+        devices = []
+    if not isinstance(acl_rules, list):
+        acl_rules = []
 
-    traffic_routes = client.v2("GET", "/trafficroutes")
-    legacy_firewall_rules = extract_data(client.legacy("GET", "/rest/firewallrule"))
-    firewall_groups = extract_data(client.legacy("GET", "/rest/firewallgroup"))
-
-    if not isinstance(legacy_firewall_rules, list):
-        legacy_firewall_rules = []
-    if not isinstance(firewall_groups, list):
-        firewall_groups = []
-
-    corporate_networks = [
-        network for network in networks if str(network.get("purpose", "")).lower() == "corporate"
+    user_policies = [
+        policy for policy in policies if isinstance(policy, dict) and policy_is_user_defined(policy)
     ]
-    wan_networks = [
-        network for network in networks if str(network.get("purpose", "")).lower() == "wan"
-    ]
-    networks_by_zone_id: dict[str, list[dict[str, Any]]] = {}
-    for network in networks:
-        zone_id = str(network.get("firewall_zone_id") or "")
-        if not zone_id:
-            continue
-        networks_by_zone_id.setdefault(zone_id, []).append(network)
-
-    zone_labels = {
-        zone_id: zone_label_from_networks(zone_networks)
-        for zone_id, zone_networks in networks_by_zone_id.items()
-    }
-
-    custom_policies = [policy for policy in firewall_policies if not policy.get("predefined")]
-    enabled_custom_policies = [policy for policy in custom_policies if policy.get("enabled", True)]
-    enabled_routes = [
-        route
-        for route in (traffic_routes if isinstance(traffic_routes, list) else [])
-        if route.get("enabled", True)
-    ]
+    enabled_user_policies = [policy for policy in user_policies if policy.get("enabled", True)]
     online_devices = [
         device for device in devices if str(device.get("state", "")).upper() == "ONLINE"
     ]
     offline_devices = [
         device for device in devices if str(device.get("state", "")).upper() != "ONLINE"
     ]
+
+    zone_networks: dict[str, list[dict[str, Any]]] = {}
+    for network in networks:
+        if not isinstance(network, dict):
+            continue
+        zone_id = str(network.get("zoneId") or "")
+        if zone_id:
+            zone_networks.setdefault(zone_id, []).append(network)
 
     findings: list[dict[str, Any]] = []
 
@@ -1000,188 +1460,58 @@ def build_firewall_audit_report(client: UniFiClient) -> dict[str, Any]:
             item["recommendation"] = recommendation
         findings.append(item)
 
-    corporate_zone_groups = {
-        zone_id: [
-            network
-            for network in zone_networks
-            if str(network.get("purpose", "")).lower() == "corporate"
-        ]
-        for zone_id, zone_networks in networks_by_zone_id.items()
-    }
-
-    iot_network = next(
-        (network for network in corporate_networks if infer_network_role(network) == "iot"), None
-    )
-    management_network = next(
-        (network for network in corporate_networks if infer_network_role(network) == "management"),
-        None,
-    )
-    dmz_network = next(
-        (network for network in corporate_networks if infer_network_role(network) == "dmz"), None
-    )
-
-    if iot_network:
-        same_zone = corporate_zone_groups.get(str(iot_network.get("firewall_zone_id")), [])
-        peer_names = [
-            network.get("name")
-            for network in same_zone
-            if network.get("_id") != iot_network.get("_id")
-        ]
-        if peer_names and not enabled_custom_policies and not legacy_firewall_rules:
+    sensitive_roles = {"dmz", "iot", "management", "storage", "work"}
+    for zone_id, members in zone_networks.items():
+        roles = {network_role(member) for member in members}
+        if len(members) <= 1:
+            continue
+        if roles & sensitive_roles and not enabled_user_policies:
             add_finding(
                 "SEG-01",
                 "segmentation",
                 "critical",
-                "IoT shares a firewall zone with trusted LANs and there are no custom "
-                "policies compensating for it.",
+                "Sensitive networks share a firewall zone and no enabled user-defined "
+                "firewall policies were found.",
                 evidence={
-                    "iot_network": iot_network.get("name"),
-                    "shared_zone_networks": peer_names,
-                    "zone_id": iot_network.get("firewall_zone_id"),
+                    "roles": sorted(roles),
+                    "zone_id": zone_id,
+                    "networks": [member.get("name") for member in members],
                 },
                 recommendation=(
-                    "Create explicit isolation rules for IoT, or move IoT into a distinct "
-                    "firewall zone before relying on zone-based policy."
+                    "Use explicit user-defined firewall policies or separate firewall zones "
+                    "before trusting this as a segmented network."
                 ),
             )
 
-    if management_network:
-        same_zone = corporate_zone_groups.get(str(management_network.get("firewall_zone_id")), [])
-        peer_names = [
-            network.get("name")
-            for network in same_zone
-            if network.get("_id") != management_network.get("_id")
-        ]
-        if peer_names and not enabled_custom_policies and not legacy_firewall_rules:
-            add_finding(
-                "SEG-02",
-                "segmentation",
-                "critical",
-                "Management shares a firewall zone with non-management networks and no "
-                "custom access policy is present.",
-                evidence={
-                    "management_network": management_network.get("name"),
-                    "shared_zone_networks": peer_names,
-                    "zone_id": management_network.get("firewall_zone_id"),
-                },
-                recommendation=(
-                    "Restrict management access with explicit allow/block policy or split "
-                    "management into a dedicated firewall zone."
-                ),
-            )
-
-    if dmz_network:
-        same_zone = corporate_zone_groups.get(str(dmz_network.get("firewall_zone_id")), [])
-        peer_names = [
-            network.get("name")
-            for network in same_zone
-            if network.get("_id") != dmz_network.get("_id")
-        ]
-        if peer_names and not enabled_custom_policies and not legacy_firewall_rules:
-            add_finding(
-                "SEG-03",
-                "segmentation",
-                "critical",
-                "DMZ currently shares a firewall zone with internal LANs and no custom "
-                "segmentation policy is visible.",
-                evidence={
-                    "dmz_network": dmz_network.get("name"),
-                    "shared_zone_networks": peer_names,
-                    "zone_id": dmz_network.get("firewall_zone_id"),
-                },
-                recommendation=(
-                    "Treat DMZ as a separate security boundary: either move it to a "
-                    "dedicated zone or add explicit block/allow rules."
-                ),
-            )
-
-    if len(corporate_networks) > 1 and not enabled_custom_policies and not legacy_firewall_rules:
+    if len(networks) > 1 and not enabled_user_policies:
         add_finding(
-            "SEG-04",
+            "SEG-02",
             "segmentation",
             "warning",
-            "All inter-VLAN behaviour appears to rely on defaults because there are no "
-            "custom firewall policies or legacy firewall rules.",
-            evidence={
-                "corporate_network_count": len(corporate_networks),
-                "custom_policy_count": len(enabled_custom_policies),
-                "legacy_firewall_rule_count": len(legacy_firewall_rules),
-            },
-            recommendation=(
-                "Document intentional defaults or add explicit inter-VLAN policy for the "
-                "network pairs you care about most."
-            ),
+            "Multiple networks exist but no enabled user-defined firewall policies were found.",
+            evidence={"network_count": len(networks), "user_policy_count": 0},
+            recommendation="Add named policies for the intended inter-network trust model.",
         )
 
-    internal_zone_ids = [zone_id for zone_id, label in zone_labels.items() if label == "Internal"]
-    external_zone_ids = [zone_id for zone_id, label in zone_labels.items() if label == "External"]
-    custom_internal_external_policies = [
-        policy
-        for policy in enabled_custom_policies
-        if str(policy.get("source", {}).get("zone_id", "")) in internal_zone_ids
-        and str(policy.get("destination", {}).get("zone_id", "")) in external_zone_ids
+    dns_specific_policies = [
+        policy for policy in enabled_user_policies if "53" in json.dumps(policy, sort_keys=True)
     ]
-    if corporate_networks and wan_networks and not custom_internal_external_policies:
+    if not dns_specific_policies:
         add_finding(
             "EGR-01",
             "egress_control",
             "warning",
-            "No custom outbound policy was found between internal networks and WAN zones.",
-            evidence={
-                "custom_internal_external_policy_count": len(custom_internal_external_policies),
-                "wan_networks": [network.get("name") for network in wan_networks],
-            },
-            recommendation=(
-                "If outbound control matters, add explicit internal-to-WAN policy for IoT, "
-                "guest, or other high-risk networks."
-            ),
-        )
-
-    dns_specific_policies = [
-        policy for policy in enabled_custom_policies if "53" in json.dumps(policy)
-    ]
-    if not dns_specific_policies:
-        add_finding(
-            "EGR-02",
-            "egress_control",
-            "warning",
-            "No explicit DNS-control policy was detected in the custom firewall policy set.",
+            "No explicit DNS-control firewall policy was detected.",
             evidence={"custom_dns_policy_count": 0},
             recommendation=(
-                "If you want clients pinned to approved resolvers, add explicit DNS policy "
-                "rather than relying on convention."
-            ),
-        )
-
-    if len(custom_policies) == 0:
-        add_finding(
-            "HYG-01",
-            "rule_hygiene",
-            "warning",
-            "The controller currently has no custom zone-based firewall policies.",
-            evidence={"custom_policy_count": 0, "predefined_policy_count": len(firewall_policies)},
-            recommendation=(
-                "That may be intentional, but it means the security model is almost entirely "
-                "the system default. Add named custom policy where you need explicit intent."
-            ),
-        )
-
-    if len(legacy_firewall_rules) == 0 and len(firewall_groups) == 0:
-        add_finding(
-            "HYG-02",
-            "rule_hygiene",
-            "informational",
-            "Legacy firewall rule and firewall group collections are both empty.",
-            evidence={"firewall_group_count": 0, "legacy_firewall_rule_count": 0},
-            recommendation=(
-                "This is tidy, but it also means there are no legacy compensating controls "
-                "for VLAN segmentation."
+                "If DNS pinning matters, add explicit policy for approved resolvers rather "
+                "than relying only on DHCP convention."
             ),
         )
 
     placeholder_named_policies = [
         policy.get("name")
-        for policy in custom_policies
+        for policy in user_policies
         if re.fullmatch(
             r"(rule|new rule|untitled)( \d+)?", str(policy.get("name", "")).strip().lower()
         )
@@ -1189,14 +1519,12 @@ def build_firewall_audit_report(client: UniFiClient) -> dict[str, Any]:
     ]
     if placeholder_named_policies:
         add_finding(
-            "HYG-03",
+            "HYG-01",
             "rule_hygiene",
             "warning",
-            "Some custom firewall policies have placeholder-style names.",
+            "Some user-defined firewall policies have placeholder-style names.",
             evidence={"placeholder_names": placeholder_named_policies},
-            recommendation=(
-                "Rename custom policies so future audits and changes are easier to reason about."
-            ),
+            recommendation="Rename policies so future audits and changes are easier to review.",
         )
 
     if offline_devices:
@@ -1206,10 +1534,7 @@ def build_firewall_audit_report(client: UniFiClient) -> dict[str, Any]:
             "critical",
             "One or more UniFi devices are offline during the audit.",
             evidence={"offline_devices": [device.get("name") for device in offline_devices]},
-            recommendation=(
-                "Bring offline network devices back before trusting firewall behaviour or "
-                "topology assumptions."
-            ),
+            recommendation="Bring offline network devices back before trusting topology checks.",
         )
 
     categories: dict[str, dict[str, Any]] = {
@@ -1228,39 +1553,35 @@ def build_firewall_audit_report(client: UniFiClient) -> dict[str, Any]:
         }
 
     overall_score = sum(item["score"] for item in categories.values())
-    critical_findings = [finding for finding in findings if finding["severity"] == "critical"]
     recommendations = [
         finding["recommendation"] for finding in findings if finding.get("recommendation")
     ]
 
-    summary = {
-        "corporate_networks": len(corporate_networks),
-        "custom_policies": len(custom_policies),
-        "firewall_groups": len(firewall_groups),
-        "legacy_firewall_rules": len(legacy_firewall_rules),
-        "offline_devices": len(offline_devices),
-        "online_devices": len(online_devices),
-        "predefined_policies": len(firewall_policies) - len(custom_policies),
-        "total_policies": len(firewall_policies),
-        "traffic_routes": len(enabled_routes),
-        "zones": [
-            {
-                "label": zone_labels[zone_id],
-                "networks": [network.get("name") for network in zone_networks],
-                "zone_id": zone_id,
-            }
-            for zone_id, zone_networks in networks_by_zone_id.items()
-        ],
-    }
-
     return {
+        "api_surface": "official_network_integration_v1",
         "categories": categories,
-        "critical_findings": critical_findings,
+        "critical_findings": [finding for finding in findings if finding["severity"] == "critical"],
         "ok": True,
         "overall_score": overall_score,
         "overall_status": score_label(overall_score),
         "recommendations": recommendations,
-        "summary": summary,
+        "summary": {
+            "acl_rules": len(acl_rules),
+            "devices_offline": len(offline_devices),
+            "devices_online": len(online_devices),
+            "firewall_policies": len(policies),
+            "firewall_zones": len(zones),
+            "networks": len(networks),
+            "user_defined_firewall_policies": len(user_policies),
+            "zone_map": [
+                {
+                    "networks": [member.get("name") for member in members],
+                    "roles": sorted({network_role(member) for member in members}),
+                    "zone_id": zone_id,
+                }
+                for zone_id, members in zone_networks.items()
+            ],
+        },
         "timestamp": datetime.now(UTC).isoformat(),
     }
 
@@ -1268,6 +1589,7 @@ def build_firewall_audit_report(client: UniFiClient) -> dict[str, Any]:
 def format_firewall_audit_human(report: dict[str, Any]) -> str:
     lines = [
         f"Firewall audit score: {report['overall_score']}/100 ({report['overall_status']})",
+        f"API surface: {report['api_surface']}",
         "",
         "Category scores:",
     ]
@@ -1286,17 +1608,18 @@ def format_firewall_audit_human(report: dict[str, Any]) -> str:
         [
             "",
             "Summary:",
-            "- Total firewall policies: "
-            f"{summary['total_policies']} ({summary['custom_policies']} custom, "
-            f"{summary['predefined_policies']} predefined)",
-            f"- Legacy firewall rules: {summary['legacy_firewall_rules']}",
-            f"- Firewall groups: {summary['firewall_groups']}",
-            f"- Traffic routes: {summary['traffic_routes']}",
-            f"- Devices online/offline: {summary['online_devices']}/{summary['offline_devices']}",
+            f"- Networks: {summary['networks']}",
+            f"- Firewall zones: {summary['firewall_zones']}",
+            "- Firewall policies: "
+            f"{summary['firewall_policies']} "
+            f"({summary['user_defined_firewall_policies']} user-defined)",
+            f"- ACL rules: {summary['acl_rules']}",
+            f"- Devices online/offline: {summary['devices_online']}/{summary['devices_offline']}",
         ]
     )
     zone_lines = ", ".join(
-        f"{zone['label']}: {', '.join(zone['networks'])}" for zone in summary["zones"]
+        f"{', '.join(zone['networks'])} ({', '.join(zone['roles'])})"
+        for zone in summary["zone_map"]
     )
     lines.append(f"- Zone map: {zone_lines or 'none'}")
 
@@ -1337,74 +1660,9 @@ def command_firewall_audit(client: UniFiClient, args: argparse.Namespace) -> Any
     return report
 
 
-def command_resource_types(_client: UniFiClient, _args: argparse.Namespace) -> Any:
-    return {
-        name: {
-            "description": config["description"],
-            "lookup": config["lookup"],
-            "path": config["path"],
-        }
-        for name, config in sorted(RESOURCE_COLLECTIONS.items())
-    }
-
-
-def command_resource_list(client: UniFiClient, args: argparse.Namespace) -> Any:
-    return client.list_resource(args.resource)
-
-
-def command_resource_show(client: UniFiClient, args: argparse.Namespace) -> Any:
-    return client.find_resource(args.resource, args.selector)
-
-
-def command_resource_create(client: UniFiClient, args: argparse.Namespace) -> Any:
-    config = resource_config(args.resource)
-    payload = json.loads(args.data_json)
-    path = f"/proxy/network/api/s/{client.config.site}/rest/{config['path']}"
-    require_confirmation(args, "POST", path, payload)
-    return client.legacy("POST", f"/rest/{config['path']}", payload=payload)
-
-
-def command_resource_merge(client: UniFiClient, args: argparse.Namespace) -> Any:
-    config = resource_config(args.resource)
-    current = client.find_resource(args.resource, args.selector)
-    merged = copy.deepcopy(current)
-    for assignment in args.set or []:
-        if "=" not in assignment:
-            raise UniFiError(
-                f"Invalid --set value '{assignment}'. Use dotted.key=value.",
-                code="invalid_argument",
-            )
-        key, raw_value = assignment.split("=", 1)
-        set_nested(merged, key, parse_json_value(raw_value))
-    path = f"/proxy/network/api/s/{client.config.site}/rest/{config['path']}/{current['_id']}"
-    require_confirmation(args, "PUT", path, merged)
-    return client.legacy("PUT", f"/rest/{config['path']}/{current['_id']}", payload=merged)
-
-
-def command_resource_delete(client: UniFiClient, args: argparse.Namespace) -> Any:
-    config = resource_config(args.resource)
-    record = client.find_resource(args.resource, args.selector)
-    path = f"/proxy/network/api/s/{client.config.site}/rest/{config['path']}/{record['_id']}"
-    require_confirmation(args, "DELETE", path, {"record": record})
-    return client.legacy("DELETE", f"/rest/{config['path']}/{record['_id']}")
-
-
-def parse_query_pairs(pairs: list[str]) -> dict[str, Any]:
-    query: dict[str, Any] = {}
-    for pair in pairs:
-        if "=" not in pair:
-            raise UniFiError(
-                f"Invalid query pair '{pair}'. Use KEY=VALUE.",
-                code="invalid_argument",
-            )
-        key, value = pair.split("=", 1)
-        query[key] = value
-    return query
-
-
 def command_request(client: UniFiClient, args: argparse.Namespace) -> Any:
     query = parse_query_pairs(args.query)
-    payload = json.loads(args.data_json) if args.data_json else None
+    payload = parse_data_json(args.data_json) if args.data_json else None
     if args.method.upper() not in {"GET", "HEAD", "OPTIONS"}:
         require_confirmation(args, args.method, args.path, payload)
     return client.request(args.method, args.path, query=query, payload=payload)
