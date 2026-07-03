@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
 
 env:
@@ -38,6 +39,7 @@ jobs:
         run: |
           version="$(./.venv/bin/python -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')"
           PYTHON="$PWD/.venv/bin/python" ./scripts/build-release-binaries.sh "v${version}" release
+          sha256sum dist/* release/*.tar.gz > release/checksums.txt
 
       - name: Upload package artifacts
         uses: actions/upload-artifact@v3
@@ -46,4 +48,5 @@ jobs:
           path: |
             dist/*
             release/*.tar.gz
+            release/checksums.txt
           if-no-files-found: error
