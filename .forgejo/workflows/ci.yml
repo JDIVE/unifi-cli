@@ -18,7 +18,7 @@ jobs:
       - name: Install Python venv support
         run: |
           apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-venv
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-venv libpython3.11
 
       - name: Create virtual environment
         run: python3 -m venv .venv
