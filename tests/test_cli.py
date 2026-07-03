@@ -369,8 +369,9 @@ def test_network_references_falls_back_after_official_500(
 
 
 def test_doctor_json_with_mocked_live_check(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path
 ) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     clear_unifi_env(monkeypatch)
     monkeypatch.setattr(
         UniFiClient,

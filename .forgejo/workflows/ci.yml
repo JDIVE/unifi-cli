@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CI: "true"
+
+jobs:
+  linux:
+    name: Linux check and package
+    runs-on: node22-playwright
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create virtual environment
+        run: python3 -m venv .venv
+
+      - name: Install dependencies
+        run: |
+          ./.venv/bin/python -m pip install --upgrade pip
+          ./.venv/bin/python -m pip install -e ".[dev]"
+
+      - name: Lint, type-check, and test
+        run: make PYTHON="$PWD/.venv/bin/python" check
+
+      - name: Build Python distributions
+        run: make PYTHON="$PWD/.venv/bin/python" build
+
+      - name: Build Linux release binary
+        run: |
+          version="$(./.venv/bin/python -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')"
+          PYTHON="$PWD/.venv/bin/python" ./scripts/build-release-binaries.sh "v${version}" release
+
+      - name: Upload package artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: unifi-cli-linux-packages
+          path: |
+            dist/*
+            release/*.tar.gz
+          if-no-files-found: error
