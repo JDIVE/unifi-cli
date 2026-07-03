@@ -15,6 +15,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Python venv support
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-venv
+
       - name: Create virtual environment
         run: python3 -m venv .venv
 
@@ -35,7 +40,7 @@ jobs:
           PYTHON="$PWD/.venv/bin/python" ./scripts/build-release-binaries.sh "v${version}" release
 
       - name: Upload package artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         with:
           name: unifi-cli-linux-packages
           path: |
