@@ -10,6 +10,7 @@ import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -117,6 +118,12 @@ OFFICIAL_RESOURCES: dict[str, OfficialResource] = {
         item_label="deviceId",
         lookup_fields=("id", "name", "macAddress", "ipAddress"),
     ),
+    "device-tag": OfficialResource(
+        name="device-tag",
+        collection="device-tags",
+        item_label="deviceTagId",
+        lookup_fields=("id", "name"),
+    ),
     "dns-policy": OfficialResource(
         name="dns-policy",
         collection="dns/policies",
@@ -146,6 +153,12 @@ OFFICIAL_RESOURCES: dict[str, OfficialResource] = {
         supports_update=True,
         supports_delete=True,
     ),
+    "mc-lag-domain": OfficialResource(
+        name="mc-lag-domain",
+        collection="switching/mc-lag-domains",
+        item_label="mcLagDomainId",
+        lookup_fields=("id", "name"),
+    ),
     "network": OfficialResource(
         name="network",
         collection="networks",
@@ -155,6 +168,30 @@ OFFICIAL_RESOURCES: dict[str, OfficialResource] = {
         supports_update=True,
         supports_delete=True,
     ),
+    "radius-profile": OfficialResource(
+        name="radius-profile",
+        collection="radius/profiles",
+        item_label="radiusProfileId",
+        lookup_fields=("id", "name"),
+    ),
+    "site-to-site-vpn": OfficialResource(
+        name="site-to-site-vpn",
+        collection="vpn/site-to-site-tunnels",
+        item_label="siteToSiteVpnId",
+        lookup_fields=("id", "name"),
+    ),
+    "switch-lag": OfficialResource(
+        name="switch-lag",
+        collection="switching/lags",
+        item_label="switchLagId",
+        lookup_fields=("id", "name"),
+    ),
+    "switch-stack": OfficialResource(
+        name="switch-stack",
+        collection="switching/switch-stacks",
+        item_label="switchStackId",
+        lookup_fields=("id", "name"),
+    ),
     "traffic-matching-list": OfficialResource(
         name="traffic-matching-list",
         collection="traffic-matching-lists",
@@ -163,6 +200,18 @@ OFFICIAL_RESOURCES: dict[str, OfficialResource] = {
         supports_create=True,
         supports_update=True,
         supports_delete=True,
+    ),
+    "vpn-server": OfficialResource(
+        name="vpn-server",
+        collection="vpn/servers",
+        item_label="vpnServerId",
+        lookup_fields=("id", "name"),
+    ),
+    "wan": OfficialResource(
+        name="wan",
+        collection="wans",
+        item_label="wanId",
+        lookup_fields=("id", "name"),
     ),
     "wifi-broadcast": OfficialResource(
         name="wifi-broadcast",
@@ -921,6 +970,21 @@ class UniFiClient:
             else:
                 official_counts[key] = self.count_official(path)
 
+        # 10.3 switching collections; older controllers (10.1) return 404. Tolerate
+        # that the same way legacy fallbacks do: store -1 and a `<key>_error` code
+        # so a missing endpoint never breaks the whole summary.
+        switching_paths = {
+            "switch_lags": f"/sites/{site_id}/switching/lags",
+            "mc_lag_domains": f"/sites/{site_id}/switching/mc-lag-domains",
+            "switch_stacks": f"/sites/{site_id}/switching/switch-stacks",
+        }
+        for key, path in switching_paths.items():
+            try:
+                official_counts[key] = self.count_official(path)
+            except UniFiError as error:
+                official_counts[key] = -1
+                official_counts[f"{key}_error"] = error.code  # type: ignore[assignment]
+
         networks = collection_items["networks"]
         wifi_broadcasts = collection_items["wifi_broadcasts"]
         fallback_counts: dict[str, int] = {}
@@ -1192,6 +1256,266 @@ def format_doctor_human(report: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _argument_type_name(action: argparse.Action) -> str | None:
+    if action.type is None:
+        if isinstance(action, argparse._StoreTrueAction | argparse._StoreFalseAction):
+            return "bool"
+        return None
+    type_obj = action.type
+    return getattr(type_obj, "__name__", str(type_obj))
+
+
+def _schema_argument(action: argparse.Action) -> dict[str, Any]:
+    is_flag = bool(action.option_strings)
+    name = action.dest if is_flag else (action.metavar or action.dest)
+    return {
+        "name": name,
+        "flags": list(action.option_strings),
+        "required": bool(action.required),
+        "default": action.default if action.default is not argparse.SUPPRESS else None,
+        "help": action.help,
+        "type": _argument_type_name(action),
+    }
+
+
+def _schema_command(
+    name: str, aliases: list[str], help_text: str | None, subparser: Any
+) -> dict[str, Any]:
+    arguments: list[dict[str, Any]] = []
+    is_write = False
+    for action in subparser._actions:
+        if isinstance(action, argparse._HelpAction):
+            continue
+        if action.dest == "yes" and action.option_strings == ["--yes"]:
+            is_write = True
+            continue
+        arguments.append(_schema_argument(action))
+    return {
+        "name": name,
+        "aliases": aliases,
+        "help": help_text,
+        "arguments": arguments,
+        "write": is_write,
+    }
+
+
+def build_schema(parser: argparse.ArgumentParser) -> dict[str, Any]:
+    """Introspect the built argparse tree into an agent-facing JSON schema.
+
+    Walks the global optionals and every registered subparser so agents can
+    discover commands, arguments, and which commands perform writes (detected by
+    the presence of the ``--yes`` guard) without a hardcoded duplicate list.
+    """
+    global_flags: list[dict[str, Any]] = []
+    subparsers_action: argparse._SubParsersAction[argparse.ArgumentParser] | None = None
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            subparsers_action = action
+            continue
+        if isinstance(action, argparse._HelpAction | argparse._VersionAction):
+            if isinstance(action, argparse._VersionAction):
+                global_flags.append(_schema_argument(action))
+            continue
+        if action.option_strings:
+            global_flags.append(_schema_argument(action))
+
+    commands: list[dict[str, Any]] = []
+    if subparsers_action is not None:
+        # Map each canonical name to its aliases by parser identity, then walk the
+        # ordered _choices_actions to keep registration order and help text.
+        alias_map: dict[int, list[str]] = {}
+        for alias, subparser in subparsers_action.choices.items():
+            alias_map.setdefault(id(subparser), []).append(alias)
+        for choice_action in subparsers_action._choices_actions:
+            name = choice_action.dest
+            subparser = subparsers_action.choices[name]
+            all_names = alias_map.get(id(subparser), [name])
+            aliases = [candidate for candidate in all_names if candidate != name]
+            commands.append(_schema_command(name, aliases, choice_action.help, subparser))
+
+    return {
+        "name": parser.prog,
+        "version": __version__,
+        "global_flags": global_flags,
+        "exit_codes": {
+            "0": "success (including dry-run previews)",
+            "1": "generic error",
+            "2": "usage error",
+            "3": "configuration or auth",
+            "4": "not found or ambiguous selector",
+            "5": "server error",
+            "6": "network or timeout",
+            "70": "unexpected error",
+        },
+        "error_shape": {
+            "ok": False,
+            "error": {
+                "code": "not_found",
+                "message": "No network matched selector 'Home'.",
+                "details": {},
+            },
+        },
+        "dry_run_shape": {
+            "ok": True,
+            "status": "dry-run",
+            "message": "Re-run with --yes to execute.",
+            "request": {
+                "method": "PUT",
+                "path": "/proxy/network/integration/v1/sites/<site>/networks/<id>",
+                "payload": {"name": "Home", "enabled": False},
+            },
+        },
+        "commands": commands,
+    }
+
+
+TABLE_CELL_MAX_CHARS = 40
+
+
+@dataclass(frozen=True)
+class TableColumn:
+    """One column of a declarative human table."""
+
+    header: str
+    getter: Callable[[dict[str, Any]], Any]
+
+
+def _get(key: str) -> Callable[[dict[str, Any]], Any]:
+    return lambda row: row.get(key)
+
+
+def _network_subnet(row: dict[str, Any]) -> Any:
+    ipv4 = row.get("ipv4Configuration")
+    if isinstance(ipv4, dict):
+        return ipv4.get("cidr") or ipv4.get("subnet") or ipv4.get("hostIpAddress")
+    return None
+
+
+def _dns_value(row: dict[str, Any]) -> Any:
+    return row.get("ipv4Address") or row.get("cname")
+
+
+def _firewall_zone_network_count(row: dict[str, Any]) -> Any:
+    for key in ("networks", "networkIds"):
+        value = row.get(key)
+        if isinstance(value, list):
+            return len(value)
+    return None
+
+
+def _firewall_policy_zone(row: dict[str, Any], *, source: bool) -> Any:
+    key = "sourceZone" if source else "destinationZone"
+    embedded = row.get(key)
+    if isinstance(embedded, dict):
+        return embedded.get("name") or embedded.get("id")
+    id_key = "sourceZoneId" if source else "destinationZoneId"
+    return row.get(id_key)
+
+
+TABLE_SPECS: dict[str, list[TableColumn]] = {
+    "devices": [
+        TableColumn("name", _get("name")),
+        TableColumn("model", _get("model")),
+        TableColumn("macAddress", _get("macAddress")),
+        TableColumn("ipAddress", _get("ipAddress")),
+        TableColumn("state", _get("state")),
+    ],
+    "clients": [
+        TableColumn("name", _get("name")),
+        TableColumn("macAddress", _get("macAddress")),
+        TableColumn("ipAddress", _get("ipAddress")),
+        TableColumn("type", _get("type")),
+        TableColumn("connectedAt", _get("connectedAt")),
+    ],
+    "networks": [
+        TableColumn("name", _get("name")),
+        TableColumn("vlanId", _get("vlanId")),
+        TableColumn("enabled", _get("enabled")),
+        TableColumn("subnet", _network_subnet),
+        TableColumn("zoneId", _get("zoneId")),
+    ],
+    "wifi-broadcasts": [
+        TableColumn("name", _get("name")),
+        TableColumn("enabled", _get("enabled")),
+        TableColumn("type", _get("type")),
+    ],
+    "dns-policies": [
+        TableColumn("domain", _get("domain")),
+        TableColumn("type", _get("type")),
+        TableColumn("value", _dns_value),
+        TableColumn("enabled", _get("enabled")),
+        TableColumn("ttlSeconds", _get("ttlSeconds")),
+    ],
+    "firewall-zones": [
+        TableColumn("name", _get("name")),
+        TableColumn("id", _get("id")),
+        TableColumn("networks", _firewall_zone_network_count),
+    ],
+    "firewall-policies": [
+        TableColumn("name", _get("name")),
+        TableColumn("action", _get("action")),
+        TableColumn("sourceZone", lambda row: _firewall_policy_zone(row, source=True)),
+        TableColumn("destZone", lambda row: _firewall_policy_zone(row, source=False)),
+        TableColumn("enabled", _get("enabled")),
+        TableColumn("index", _get("index")),
+    ],
+}
+
+
+def _table_cell(value: Any) -> str:
+    if value is None:
+        text = ""
+    elif isinstance(value, bool):
+        text = "true" if value else "false"
+    else:
+        text = str(value)
+    if len(text) > TABLE_CELL_MAX_CHARS:
+        return text[: TABLE_CELL_MAX_CHARS - 1] + "…"
+    return text
+
+
+def render_table(
+    rows: list[dict[str, Any]],
+    columns: list[TableColumn],
+    *,
+    total_count: int | None = None,
+) -> str:
+    headers = [column.header for column in columns]
+    body: list[list[str]] = []
+    for row in rows:
+        body.append([_table_cell(column.getter(row)) for column in columns])
+
+    widths = [len(header) for header in headers]
+    for cells in body:
+        for index, cell in enumerate(cells):
+            widths[index] = max(widths[index], len(cell))
+
+    def format_row(cells: list[str]) -> str:
+        return "  ".join(cell.ljust(widths[index]) for index, cell in enumerate(cells)).rstrip()
+
+    lines = [format_row(headers), format_row(["-" * width for width in widths])]
+    lines.extend(format_row(cells) for cells in body)
+
+    shown = len(rows)
+    footer_total = total_count if total_count is not None else shown
+    lines.append(f"{shown} of {footer_total}")
+    return "\n".join(lines)
+
+
+def format_list_table(command: str, payload: Any) -> str | None:
+    """Render a list payload as a human table if the command has a spec.
+
+    Returns ``None`` when the command has no table spec so the caller falls back
+    to JSON output, preserving behaviour for un-specified commands.
+    """
+    columns = TABLE_SPECS.get(command)
+    if columns is None:
+        return None
+    rows = [item for item in data_list(payload) if isinstance(item, dict)]
+    total_count = count_collection(payload) if isinstance(payload, dict) else len(rows)
+    return render_table(rows, columns, total_count=total_count)
+
+
 def command_app_info(client: UniFiClient, _args: argparse.Namespace) -> Any:
     return client.official("GET", "/info")
 
@@ -1243,7 +1567,9 @@ def command_official_merge(
 ) -> Any:
     spec = official_resource(resource_name)
     require_capability(spec, "update")
-    current = client.find_official(spec, args.selector)
+    record_type_arg = getattr(args, "record_type", None)
+    record_type = normalise_record_type(record_type_arg) if record_type_arg else None
+    current = client.find_official(spec, args.selector, record_type=record_type)
     merged = copy.deepcopy(current)
     if args.data_json:
         data = parse_data_json(args.data_json)
@@ -1435,6 +1761,28 @@ def command_reservation_set(client: UniFiClient, args: argparse.Namespace) -> An
     )
     require_confirmation(args, "PUT", legacy_dry_run_path(client, path), payload)
     return client.legacy("PUT", path, payload=payload)
+
+
+def command_reservation_create(client: UniFiClient, args: argparse.Namespace) -> Any:
+    """Pre-provision a DHCP reservation by creating a new remembered client.
+
+    Unlike ``reservation-set``, this does not require the controller to already
+    know the MAC. It POSTs a fresh remembered client via the legacy ``/rest/user``
+    collection with a fixed IP so a reservation can exist before the device is
+    ever seen.
+    """
+    payload: dict[str, Any] = {
+        "mac": args.mac,
+        "use_fixedip": True,
+        "fixed_ip": args.ip,
+    }
+    if args.name:
+        payload["name"] = args.name
+    if args.network_id:
+        payload["network_id"] = args.network_id
+    path = "/rest/user"
+    require_confirmation(args, "POST", legacy_dry_run_path(client, path), payload)
+    return client.legacy("POST", path, payload=payload)
 
 
 def command_reservation_clear(client: UniFiClient, args: argparse.Namespace) -> Any:
@@ -1866,6 +2214,20 @@ def command_legacy_fallback_types(_client: UniFiClient, _args: argparse.Namespac
 
 def command_legacy_fallback_list(client: UniFiClient, args: argparse.Namespace) -> Any:
     return client.list_legacy_fallback(args.resource)
+
+
+def command_legacy_fallback_create(client: UniFiClient, args: argparse.Namespace) -> Any:
+    spec = legacy_resource(args.resource)
+    payload = parse_data_json(args.data_json)
+    if not isinstance(payload, dict):
+        raise UniFiError("--data-json must be a JSON object.", code="invalid_argument")
+    # Both legacy /rest/* and v2 collection paths accept a POST to the collection
+    # itself; there is no separate create suffix.
+    suffix, use_v2 = client.legacy_fallback_path(spec)
+    require_confirmation(args, "POST", legacy_dry_run_path(client, suffix, v2=use_v2), payload)
+    if use_v2:
+        return client.legacy_v2("POST", suffix, payload=payload)
+    return client.legacy("POST", suffix, payload=payload)
 
 
 def command_legacy_fallback_show(client: UniFiClient, args: argparse.Namespace) -> Any:

@@ -13,10 +13,15 @@ from unifi_cli.cli import build_parser, main
 from unifi_cli.config import Config, build_config
 from unifi_cli.core import (
     REDACTED,
+    TABLE_SPECS,
+    TableColumn,
     UniFiClient,
     UniFiError,
+    build_schema,
     count_collection,
     exit_code_for_error,
+    format_list_table,
+    render_table,
     scrub_sensitive,
     strip_read_only,
 )
@@ -1096,3 +1101,468 @@ def test_doctor_reports_bad_config_permissions(
     # A bad-permissions warning must not flip overall ok to false on its own.
     assert exit_code == 0
     assert payload["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# (m) schema command: valid JSON, exit codes, write flags, offline
+# ---------------------------------------------------------------------------
+
+
+def test_schema_command_emits_valid_json(
+    capsys: pytest.CaptureFixture[str], tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # schema is fully offline: no config, no base URL, no API key required.
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    clear_unifi_env(monkeypatch)
+
+    exit_code = main(["schema"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert payload["name"] == "unifi"
+    assert set(payload["exit_codes"]) == {"0", "1", "2", "3", "4", "5", "6", "70"}
+    assert payload["exit_codes"]["0"].startswith("success")
+    assert payload["exit_codes"]["2"] == "usage error"
+    assert "error" in payload["error_shape"]
+    assert payload["dry_run_shape"]["status"] == "dry-run"
+
+    commands = {command["name"]: command for command in payload["commands"]}
+    # A read command has write=false; a write command has write=true.
+    assert commands["networks"]["write"] is False
+    assert commands["network-merge"]["write"] is True
+    assert commands["schema"]["write"] is False
+    # Aliases are surfaced without duplicating them as separate commands.
+    assert commands["wifi-broadcasts"]["aliases"] == ["wlans"]
+    assert "wlans" not in commands
+
+
+def test_schema_build_directly_marks_writes_via_yes_guard() -> None:
+    schema = build_schema(build_parser())
+    commands = {command["name"]: command for command in schema["commands"]}
+    # Newly-added commands report the expected write classification.
+    assert commands["dns-merge"]["write"] is True
+    assert commands["reservation-create"]["write"] is True
+    assert commands["legacy-fallback-create"]["write"] is True
+    assert commands["switch-lags"]["write"] is False
+    assert commands["switch-lag-show"]["write"] is False
+    # The --yes guard argument is folded into `write`, not exposed as an argument.
+    merge_args = {arg["name"] for arg in commands["network-merge"]["arguments"]}
+    assert "yes" not in merge_args
+
+
+# ---------------------------------------------------------------------------
+# (n) new item shows resolve by name through find_official
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("command", "resource_name", "collection_suffix"),
+    [
+        ("wan-show", "wan", "/wans"),
+        ("radius-profile-show", "radius-profile", "/radius/profiles"),
+        ("device-tag-show", "device-tag", "/device-tags"),
+        ("vpn-server-show", "vpn-server", "/vpn/servers"),
+        ("site-to-site-vpn-show", "site-to-site-vpn", "/vpn/site-to-site-tunnels"),
+        ("switch-lag-show", "switch-lag", "/switching/lags"),
+        ("mc-lag-domain-show", "mc-lag-domain", "/switching/mc-lag-domains"),
+        ("switch-stack-show", "switch-stack", "/switching/switch-stacks"),
+    ],
+)
+def test_new_show_commands_resolve_by_name(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+    resource_name: str,
+    collection_suffix: str,
+) -> None:
+    def fake_official(self: UniFiClient, method: str, suffix: str, **kwargs) -> dict:
+        del self, method, kwargs
+        assert suffix.endswith(collection_suffix)
+        return envelope([{"id": "obj-1", "name": "target"}], total_count=1)
+
+    monkeypatch.setattr(UniFiClient, "official", fake_official)
+
+    exit_code = main(
+        [
+            "--json",
+            "--base-url",
+            "https://controller.example",
+            "--api-key",
+            "secret",
+            "--site-id",
+            "site-1",
+            command,
+            "target",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert payload["id"] == "obj-1"
+    assert payload["name"] == "target"
+
+
+# ---------------------------------------------------------------------------
+# (o) switch-lags list hits the right path
+# ---------------------------------------------------------------------------
+
+
+def test_switch_lags_list_hits_right_path(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seen: dict[str, str] = {}
+
+    def fake_official(self: UniFiClient, method: str, suffix: str, **kwargs) -> dict:
+        del self, method, kwargs
+        seen["suffix"] = suffix
+        return envelope([{"id": "lag-1", "name": "core"}], total_count=1)
+
+    monkeypatch.setattr(UniFiClient, "official", fake_official)
+
+    exit_code = main(
+        [
+            "--json",
+            "--base-url",
+            "https://controller.example",
+            "--api-key",
+            "secret",
+            "--site-id",
+            "site-1",
+            "switch-lags",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert seen["suffix"] == "/sites/site-1/switching/lags"
+    assert [item["id"] for item in payload["data"]] == ["lag-1"]
+
+
+# ---------------------------------------------------------------------------
+# (p) summary tolerates 404 on the new switching counts
+# ---------------------------------------------------------------------------
+
+
+def test_summary_tolerates_404_on_switching_counts(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_official(self: UniFiClient, method: str, suffix: str, **kwargs) -> object:
+        del method, kwargs
+        if suffix == "/info":
+            return {"applicationVersion": "10.1.0"}
+        if suffix == "/sites":
+            return {"data": [{"id": "site-1", "name": "default"}]}
+        if "/switching/" in suffix:
+            raise UniFiError(
+                "not found",
+                code="http_error",
+                details={"status": 404, "body": "not found"},
+            )
+        return envelope([], total_count=0)
+
+    monkeypatch.setattr(UniFiClient, "official", fake_official)
+    monkeypatch.setattr(UniFiClient, "list_legacy_fallback", lambda self, resource: {"data": []})
+
+    client = make_client()
+    summary = client.summary()
+
+    counts = summary["counts"]
+    for key in ("switch_lags", "mc_lag_domains", "switch_stacks"):
+        assert counts[key] == -1
+        assert counts[f"{key}_error"] == "http_error"
+
+
+# ---------------------------------------------------------------------------
+# (q) dns-merge strips id and honours record-type disambiguation
+# ---------------------------------------------------------------------------
+
+
+def test_dns_merge_strips_id_and_honours_record_type(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_find_official(
+        self: UniFiClient,
+        resource,
+        selector: str,
+        *,
+        record_type: str | None = None,
+    ) -> dict:
+        del self, resource, selector
+        captured["record_type"] = record_type
+        return {
+            "id": "dns-1",
+            "metadata": {"origin": "USER_DEFINED"},
+            "domain": "foo.internal",
+            "type": "A_RECORD",
+            "ipv4Address": "10.0.0.9",
+            "enabled": True,
+        }
+
+    monkeypatch.setattr(UniFiClient, "find_official", fake_find_official)
+
+    exit_code = main(
+        [
+            "--json",
+            "--base-url",
+            "https://controller.example",
+            "--api-key",
+            "secret",
+            "--site-id",
+            "site-1",
+            "dns-merge",
+            "foo.internal",
+            "--record-type",
+            "A",
+            "--set",
+            "enabled=false",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    # --record-type A normalises to A_RECORD before find_official.
+    assert captured["record_type"] == "A_RECORD"
+    body = payload["request"]["payload"]
+    assert body["enabled"] is False
+    assert "id" not in body
+    assert "metadata" not in body
+    assert payload["request"]["method"] == "PUT"
+    assert payload["request"]["path"].endswith("/dns/policies/dns-1")
+
+
+# ---------------------------------------------------------------------------
+# (r) legacy-fallback-create dry-run: POST to collection, v2 vs rest selection
+# ---------------------------------------------------------------------------
+
+
+def test_legacy_fallback_create_rest_path_dry_run(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exit_code = main(
+        [
+            "--json",
+            "--base-url",
+            "https://controller.example",
+            "--api-key",
+            "secret",
+            "legacy-fallback-create",
+            "port-forward",
+            "--data-json",
+            '{"name": "web", "dst_port": "443"}',
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert payload["status"] == "dry-run"
+    assert payload["request"]["method"] == "POST"
+    # /rest/* legacy resources POST to the s/<site> base collection path.
+    assert payload["request"]["path"] == "/proxy/network/api/s/default/rest/portforward"
+    assert payload["request"]["payload"] == {"name": "web", "dst_port": "443"}
+
+
+def test_legacy_fallback_create_v2_path_dry_run(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exit_code = main(
+        [
+            "--json",
+            "--base-url",
+            "https://controller.example",
+            "--api-key",
+            "secret",
+            "legacy-fallback-create",
+            "traffic-route",
+            "--data-json",
+            '{"name": "vpn-route"}',
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert payload["status"] == "dry-run"
+    assert payload["request"]["method"] == "POST"
+    # Non-/rest legacy resources POST to the v2 site collection path.
+    assert payload["request"]["path"] == "/proxy/network/v2/api/site/default/trafficroutes"
+
+
+# ---------------------------------------------------------------------------
+# (s) reservation-create dry-run payload
+# ---------------------------------------------------------------------------
+
+
+def test_reservation_create_dry_run_payload(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exit_code = main(
+        [
+            "--json",
+            "--base-url",
+            "https://controller.example",
+            "--api-key",
+            "secret",
+            "reservation-create",
+            "--mac",
+            "00:11:22:33:44:55",
+            "--ip",
+            "10.1.40.50",
+            "--name",
+            "printer",
+            "--network-id",
+            "net-legacy-1",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert payload["status"] == "dry-run"
+    assert payload["request"]["method"] == "POST"
+    assert payload["request"]["path"] == "/proxy/network/api/s/default/rest/user"
+    assert payload["request"]["payload"] == {
+        "mac": "00:11:22:33:44:55",
+        "use_fixedip": True,
+        "fixed_ip": "10.1.40.50",
+        "name": "printer",
+        "network_id": "net-legacy-1",
+    }
+
+
+def test_reservation_create_minimal_payload_omits_optional_fields(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exit_code = main(
+        [
+            "--json",
+            "--base-url",
+            "https://controller.example",
+            "--api-key",
+            "secret",
+            "reservation-create",
+            "--mac",
+            "aa:bb:cc:dd:ee:ff",
+            "--ip",
+            "10.1.40.51",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert payload["request"]["payload"] == {
+        "mac": "aa:bb:cc:dd:ee:ff",
+        "use_fixedip": True,
+        "fixed_ip": "10.1.40.51",
+    }
+
+
+# ---------------------------------------------------------------------------
+# (t) table formatter: aligned columns + footer, and TTY/non-TTY switch
+# ---------------------------------------------------------------------------
+
+
+def test_render_table_aligns_columns_and_footer() -> None:
+    columns = [
+        TableColumn("name", lambda row: row.get("name")),
+        TableColumn("enabled", lambda row: row.get("enabled")),
+    ]
+    rows = [
+        {"name": "Home", "enabled": True},
+        {"name": "Guest-Network", "enabled": False},
+    ]
+    rendered = render_table(rows, columns, total_count=5)
+    lines = rendered.splitlines()
+
+    assert lines[0] == "name           enabled"
+    # Separator row width matches the widest cell in each column.
+    assert lines[1].startswith("-------------")
+    # Bool values are normalised to true/false.
+    assert "true" in lines[2]
+    assert "false" in lines[3]
+    # Footer reports shown-of-total using the provided total_count.
+    assert lines[-1] == "2 of 5"
+
+
+def test_render_table_truncates_long_cells() -> None:
+    columns = [TableColumn("value", lambda row: row.get("value"))]
+    long_value = "x" * 100
+    rendered = render_table([{"value": long_value}], columns)
+    data_line = rendered.splitlines()[2]
+    # Long cells are truncated to the cell max with an ellipsis marker.
+    assert data_line.endswith("…")
+    assert len(data_line.rstrip()) == 40
+
+
+def test_format_list_table_returns_none_without_spec() -> None:
+    assert format_list_table("sites", {"data": []}) is None
+    assert "devices" in TABLE_SPECS
+
+
+def test_tty_renders_table_without_json(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def fake_official(self: UniFiClient, method: str, suffix: str, **kwargs) -> dict:
+        del self, method, suffix, kwargs
+        return envelope(
+            [
+                {
+                    "name": "AP",
+                    "model": "U6",
+                    "macAddress": "aa:bb:cc:dd:ee:ff",
+                    "ipAddress": "10.1.40.5",
+                    "state": "ONLINE",
+                }
+            ],
+            total_count=1,
+        )
+
+    monkeypatch.setattr(UniFiClient, "official", fake_official)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+
+    exit_code = main(
+        [
+            "--base-url",
+            "https://controller.example",
+            "--api-key",
+            "secret",
+            "--site-id",
+            "site-1",
+            "devices",
+        ]
+    )
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    # Human table output, not JSON, on a TTY without --json.
+    assert out.startswith("name")
+    assert "macAddress" in out
+    assert "1 of 1" in out
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(out)
+
+
+def test_non_tty_emits_json_without_json_flag(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def fake_official(self: UniFiClient, method: str, suffix: str, **kwargs) -> dict:
+        del self, method, suffix, kwargs
+        return envelope([{"name": "AP", "model": "U6", "state": "ONLINE"}], total_count=1)
+
+    monkeypatch.setattr(UniFiClient, "official", fake_official)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: False)
+
+    exit_code = main(
+        [
+            "--base-url",
+            "https://controller.example",
+            "--api-key",
+            "secret",
+            "--site-id",
+            "site-1",
+            "devices",
+        ]
+    )
+    out = capsys.readouterr().out
+
+    assert exit_code == 0
+    # Piped (non-TTY) output stays JSON even without --json, preserving agent behaviour.
+    payload = json.loads(out)
+    assert [item["name"] for item in payload["data"]] == ["AP"]

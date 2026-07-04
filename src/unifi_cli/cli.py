@@ -18,6 +18,7 @@ from unifi_cli.core import (
     add_list_args,
     add_query_args,
     add_write_guard,
+    build_schema,
     command_acl_rules,
     command_app_info,
     command_client_action,
@@ -42,6 +43,7 @@ from unifi_cli.core import (
     command_firewall_audit,
     command_firewall_policies,
     command_firewall_zones,
+    command_legacy_fallback_create,
     command_legacy_fallback_delete,
     command_legacy_fallback_list,
     command_legacy_fallback_merge,
@@ -67,6 +69,7 @@ from unifi_cli.core import (
     command_remembered_clients,
     command_request,
     command_reservation_clear,
+    command_reservation_create,
     command_reservation_set,
     command_site_to_site_vpns,
     command_sites,
@@ -84,6 +87,7 @@ from unifi_cli.core import (
     doctor,
     exit_code_for_error,
     format_doctor_human,
+    format_list_table,
     scrub_sensitive,
 )
 
@@ -254,6 +258,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     doctor_parser.set_defaults(func=None)
 
+    schema_parser = subparsers.add_parser(
+        "schema", help="emit a machine-readable schema of commands, flags, and exit codes"
+    )
+    schema_parser.set_defaults(func=None)
+
     app_info = subparsers.add_parser("app-info", help="show UniFi Network application info")
     app_info.set_defaults(func=command_app_info)
 
@@ -361,6 +370,17 @@ def build_parser() -> argparse.ArgumentParser:
     add_write_guard(reservation_set)
     reservation_set.set_defaults(func=command_reservation_set)
 
+    reservation_create = subparsers.add_parser(
+        "reservation-create",
+        help="legacy fallback: create a new remembered client with a DHCP reservation",
+    )
+    reservation_create.add_argument("--mac", required=True, help="client MAC address")
+    reservation_create.add_argument("--ip", required=True, help="reserved IP address")
+    reservation_create.add_argument("--name", help="optional client name")
+    reservation_create.add_argument("--network-id", help="optional legacy network_id")
+    add_write_guard(reservation_create)
+    reservation_create.set_defaults(func=command_reservation_create)
+
     reservation_clear = subparsers.add_parser(
         "reservation-clear",
         help="legacy fallback: remove a DHCP reservation from a remembered client",
@@ -445,6 +465,13 @@ def build_parser() -> argparse.ArgumentParser:
     add_write_guard(dns_delete)
     dns_delete.set_defaults(func=command_dns_delete)
 
+    dns_merge = subparsers.add_parser(
+        "dns-merge", help="fetch-merge-update one official DNS policy"
+    )
+    add_merge_args(dns_merge)
+    dns_merge.add_argument("--record-type", help="optional A, A_RECORD, or CNAME disambiguator")
+    dns_merge.set_defaults(func=bind(command_official_merge, "dns-policy"))
+
     add_official_crud(
         subparsers,
         resource="firewall-zone",
@@ -492,6 +519,33 @@ def build_parser() -> argparse.ArgumentParser:
         item = subparsers.add_parser(name, help=help_text)
         add_list_args(item)
         item.set_defaults(func=func)
+
+    # Item shows for read-only list resources, resolved through find_official.
+    # The plural list commands above keep their existing raw-path behaviour.
+    for noun, resource in [
+        ("wan", "wan"),
+        ("radius-profile", "radius-profile"),
+        ("device-tag", "device-tag"),
+        ("vpn-server", "vpn-server"),
+        ("site-to-site-vpn", "site-to-site-vpn"),
+    ]:
+        show_parser = subparsers.add_parser(f"{noun}-show", help=f"show one {noun}")
+        show_parser.add_argument("selector")
+        show_parser.set_defaults(func=bind(command_official_show, resource))
+
+    # New 10.3 read-only switching endpoints, wired via the official CRUD helper
+    # so list commands honour --all and shows go through find_official.
+    for plural, noun, resource in [
+        ("switch-lags", "switch-lag", "switch-lag"),
+        ("mc-lag-domains", "mc-lag-domain", "mc-lag-domain"),
+        ("switch-stacks", "switch-stack", "switch-stack"),
+    ]:
+        add_official_crud(
+            subparsers,
+            resource=resource,
+            noun=noun,
+            plural=plural,
+        )
 
     for name, metadata_func, help_text in [
         ("dpi-categories", command_dpi_categories, "list official DPI application categories"),
@@ -545,6 +599,15 @@ def build_parser() -> argparse.ArgumentParser:
     fallback_show.add_argument("resource", choices=sorted(LEGACY_RESOURCES))
     fallback_show.add_argument("selector")
     fallback_show.set_defaults(func=command_legacy_fallback_show)
+
+    fallback_create = subparsers.add_parser(
+        "legacy-fallback-create",
+        help="create one legacy fallback object via POST to its collection",
+    )
+    fallback_create.add_argument("resource", choices=sorted(LEGACY_RESOURCES))
+    add_data_json(fallback_create)
+    add_write_guard(fallback_create)
+    fallback_create.set_defaults(func=command_legacy_fallback_create)
 
     fallback_merge = subparsers.add_parser(
         "legacy-fallback-merge",
@@ -608,6 +671,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
+        # schema is fully offline: it never needs config or a client. Handle it
+        # before build_config, like doctor is special-cased.
+        if args.command == "schema":
+            emit_json(build_schema(parser))
+            return 0
+
         if (
             getattr(args, "action", None) is None
             and getattr(args, "data_json", None) is None
@@ -632,6 +701,11 @@ def main(argv: list[str] | None = None) -> int:
             raise UniFiError("No command selected.", code="invalid_argument")
 
         result = args.func(client, args)
+        if not args.json and sys.stdout.isatty():
+            table = format_list_table(args.command, result)
+            if table is not None:
+                print(table)
+                return 0
         if args.json or not isinstance(result, str):
             emit_json(result)
         else:
