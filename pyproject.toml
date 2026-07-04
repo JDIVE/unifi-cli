@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "unifi-cli"
-version = "0.2.1"
+dynamic = ["version"]
 description = "Safe UniFi Network CLI for inventory, DNS, reservations, and guarded write operations."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -41,6 +41,9 @@ dev = [
 
 [project.scripts]
 unifi = "unifi_cli.cli:main"
+
+[tool.hatch.version]
+path = "src/unifi_cli/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/unifi_cli"]

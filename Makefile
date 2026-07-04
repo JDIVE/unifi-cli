@@ -1,5 +1,5 @@
 PYTHON ?= python3
-VERSION ?= $(shell $(PYTHON) -c "import pathlib, tomllib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+VERSION ?= $(shell $(PYTHON) -c "import pathlib, re; print(re.search(r'__version__\s*=\s*\"([^\"]+)\"', pathlib.Path('src/unifi_cli/__init__.py').read_text()).group(1))")
 
 .PHONY: install-dev format lint typecheck test check build install-local release-binaries clean
 

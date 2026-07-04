@@ -14,10 +14,12 @@ DEFAULT_TIMEOUT_SECONDS = 30
 ENV_ALIASES: dict[str, list[str]] = {
     "base_url": ["UNIFI_BASE_URL", "UNIFI_NETWORK_BASE_URL"],
     "api_key": ["UNIFI_API_KEY", "UNIFI_NETWORK_API_KEY"],
+    "cloud_api_key": ["UNIFI_CLOUD_API_KEY"],
     "site": ["UNIFI_SITE"],
     "site_id": ["UNIFI_SITE_ID"],
     "verify_tls": ["UNIFI_VERIFY_TLS"],
     "timeout_seconds": ["UNIFI_TIMEOUT_SECONDS"],
+    "allow_foreign_host": ["UNIFI_ALLOW_FOREIGN_HOST"],
 }
 
 
@@ -27,8 +29,10 @@ class Config:
     site: str
     site_id: str | None
     api_key: str | None
+    cloud_api_key: str | None
     verify_tls: bool
     timeout_seconds: int
+    allow_foreign_host: bool
     config_path: Path
     config_exists: bool
     sources: dict[str, str]
@@ -126,6 +130,14 @@ def build_config(args: argparse.Namespace) -> Config:
         default=None,
         transform=str,
     )
+    cloud_api_key, sources["cloud_api_key"] = _resolve_value(
+        arg_value=getattr(args, "cloud_api_key", None),
+        env_names=ENV_ALIASES["cloud_api_key"],
+        config_data=config_data,
+        config_key="cloud_api_key",
+        default=None,
+        transform=str,
+    )
 
     insecure_flag = getattr(args, "insecure", False)
     verify_arg = False if insecure_flag else None
@@ -145,14 +157,26 @@ def build_config(args: argparse.Namespace) -> Config:
         default=DEFAULT_TIMEOUT_SECONDS,
         transform=int,
     )
+    allow_foreign_flag = getattr(args, "allow_foreign_host", False)
+    allow_foreign_arg = True if allow_foreign_flag else None
+    allow_foreign_host, sources["allow_foreign_host"] = _resolve_value(
+        arg_value=allow_foreign_arg,
+        env_names=ENV_ALIASES["allow_foreign_host"],
+        config_data=config_data,
+        config_key="allow_foreign_host",
+        default=False,
+        transform=lambda value: parse_bool(value, default=False),
+    )
 
     return Config(
         base_url=base_url,
         site=site,
         site_id=site_id,
         api_key=api_key,
+        cloud_api_key=cloud_api_key,
         verify_tls=verify_tls,
         timeout_seconds=timeout_seconds,
+        allow_foreign_host=allow_foreign_host,
         config_path=config_path,
         config_exists=config_path.exists(),
         sources=sources,

@@ -8,6 +8,7 @@ import sys
 from collections.abc import Callable
 from typing import Any
 
+from unifi_cli import __version__
 from unifi_cli.config import build_config, default_config_path
 from unifi_cli.core import (
     LEGACY_RESOURCES,
@@ -81,6 +82,7 @@ from unifi_cli.core import (
     command_wifi_broadcast_show,
     command_wifi_broadcasts,
     doctor,
+    exit_code_for_error,
     format_doctor_human,
     scrub_sensitive,
 )
@@ -209,6 +211,11 @@ def build_parser() -> argparse.ArgumentParser:
         prog="unifi",
         description="Safe UniFi Network CLI built around the official local Network API.",
     )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     parser.add_argument(
         "--config",
@@ -217,6 +224,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-url", help="controller base URL, for example https://192.168.1.1")
     parser.add_argument(
         "--api-key", help="one-off API key override; prefer env or config for normal use"
+    )
+    parser.add_argument(
+        "--cloud-api-key",
+        help="API key for the cloud connector host; prefer env or config for normal use",
+    )
+    parser.add_argument(
+        "--allow-foreign-host",
+        action="store_true",
+        help="allow sending the API key to hosts other than the controller or cloud connector",
     )
     parser.add_argument("--site", help="UniFi site name or slug")
     parser.add_argument("--site-id", help="UniFi site UUID if auto-resolution is unreliable")
@@ -634,7 +650,22 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
         emit_error(error, as_json=args.json)
-        return 1
+        return exit_code_for_error(error)
+    except Exception as error:  # noqa: BLE001
+        if args.json:
+            emit_json(
+                {
+                    "error": {
+                        "code": "unexpected_error",
+                        "details": {"exception": type(error).__name__},
+                        "message": str(error),
+                    },
+                    "ok": False,
+                }
+            )
+        else:
+            print(str(error), file=sys.stderr)
+        return 70
 
 
 if __name__ == "__main__":

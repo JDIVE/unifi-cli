@@ -21,20 +21,37 @@ REDACTED = "***REDACTED***"
 OFFICIAL_API_BASE = "/proxy/network/integration/v1"
 LEGACY_API_BASE_TEMPLATE = "/proxy/network/api/s/{site}"
 LEGACY_V2_BASE_TEMPLATE = "/proxy/network/v2/api/site/{site}"
-SECRET_FIELD_NAMES = {
-    "api_key",
-    "apikey",
-    "auth",
-    "authorization",
+CLOUD_CONNECTOR_HOST = "api.ui.com"
+OFFICIAL_PAGE_LIMIT = 200
+# Top-level keys the official update schemas do not accept; echoing a GET body
+# straight into a PUT includes these and fails strict validation with HTTP 400.
+OFFICIAL_READ_ONLY_FIELDS = {
+    "id",
+    "metadata",
+    "statistics",
+    "createdAt",
+    "updatedAt",
+    "revision",
+}
+# Substrings that mark a field as secret. Matched against a lowercased key name.
+SECRET_FIELD_SUBSTRINGS = (
+    "secret",
     "passphrase",
     "password",
     "psk",
-    "secret",
     "token",
-    "x_secret",
-    "x_iapp_key",
-    "x_passphrase",
-}
+    "apikey",
+    "api_key",
+    "privatekey",
+    "private_key",
+    "presharedkey",
+    "pre_shared_key",
+    "authkey",
+    "credential",
+)
+# Exact (lowercased) key names that are always secret.
+SECRET_FIELD_EXACT = {"auth", "authorization", "x-api-key"}
+HTTP_ERROR_BODY_MAX_CHARS = 2000
 LEGACY_CLIENT_EDITABLE_FIELDS = [
     "name",
     "note",
@@ -226,11 +243,18 @@ def ensure_live_config(config: Config, *, require_base_url: bool = True) -> None
         )
 
 
+def key_is_secret(key: str) -> bool:
+    lowered = key.lower()
+    if lowered in SECRET_FIELD_EXACT:
+        return True
+    return any(marker in lowered for marker in SECRET_FIELD_SUBSTRINGS)
+
+
 def scrub_sensitive(value: Any) -> Any:
     if isinstance(value, dict):
         cleaned: dict[str, Any] = {}
         for key, item in value.items():
-            if key.lower() in SECRET_FIELD_NAMES:
+            if isinstance(key, str) and key_is_secret(key):
                 cleaned[key] = REDACTED
             else:
                 cleaned[key] = scrub_sensitive(item)
@@ -238,6 +262,23 @@ def scrub_sensitive(value: Any) -> Any:
     if isinstance(value, list):
         return [scrub_sensitive(item) for item in value]
     return value
+
+
+def strip_read_only(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of ``payload`` without official read-only top-level keys."""
+    return {key: value for key, value in payload.items() if key not in OFFICIAL_READ_ONLY_FIELDS}
+
+
+def reject_read_only_set(assignment: str) -> None:
+    """Reject a ``--set`` assignment that targets an official read-only field."""
+    key = assignment.split("=", 1)[0]
+    top_level = key.split(".", 1)[0].strip()
+    if top_level in OFFICIAL_READ_ONLY_FIELDS:
+        raise UniFiError(
+            f"Refusing to set read-only field '{top_level}'.",
+            code="invalid_argument",
+            details={"read_only_fields": sorted(OFFICIAL_READ_ONLY_FIELDS)},
+        )
 
 
 def parse_json_value(raw: str) -> Any:
@@ -288,6 +329,12 @@ def extract_data(payload: Any) -> Any:
 
 
 def count_collection(payload: Any) -> int:
+    if isinstance(payload, dict):
+        total_count = payload.get("totalCount")
+        if isinstance(total_count, bool):
+            total_count = None
+        if isinstance(total_count, int):
+            return total_count
     data = extract_data(payload)
     if isinstance(data, list):
         return len(data)
@@ -330,6 +377,28 @@ def http_status(error: UniFiError) -> int | None:
         return None
     status = error.details.get("status")
     return status if isinstance(status, int) else None
+
+
+def exit_code_for_error(error: UniFiError) -> int:
+    """Map a UniFiError to the CLI exit-code contract.
+
+    0 success (handled by callers), 1 generic UniFiError fallback,
+    3 configuration/auth, 4 not found / ambiguous, 5 server error,
+    6 network/timeout. 2 (argparse) and 70 (unexpected) are handled elsewhere.
+    """
+    code = error.code
+    status = http_status(error)
+    if code == "config_missing":
+        return 3
+    if code == "http_error" and status in {401, 403}:
+        return 3
+    if code in {"not_found", "ambiguous_selector"}:
+        return 4
+    if code == "http_error" and status is not None and status >= 500:
+        return 5
+    if code in {"network_error", "timeout"}:
+        return 6
+    return 1
 
 
 def path_with_query(path: str, query: dict[str, Any]) -> str:
@@ -389,6 +458,20 @@ class UniFiClient:
         else:
             self.ssl_context = ssl._create_unverified_context()  # noqa: SLF001
 
+    def _api_key_for_host(self, host: str, *, cloud_host: str | None) -> str:
+        """Pick the API key to send for a given target host.
+
+        When the request targets the cloud connector host and a dedicated
+        ``cloud_api_key`` is configured, that key is used; otherwise the
+        controller key is used.
+        """
+        cloud_hosts = {CLOUD_CONNECTOR_HOST}
+        if cloud_host:
+            cloud_hosts.add(cloud_host)
+        if host in cloud_hosts and self.config.cloud_api_key:
+            return str(self.config.cloud_api_key)
+        return str(self.config.api_key)
+
     def request(
         self,
         method: str,
@@ -396,6 +479,7 @@ class UniFiClient:
         *,
         query: dict[str, Any] | None = None,
         payload: Any | None = None,
+        cloud_host: str | None = None,
     ) -> Any:
         is_absolute_url = path.startswith("http://") or path.startswith("https://")
         ensure_live_config(self.config, require_base_url=not is_absolute_url)
@@ -410,8 +494,32 @@ class UniFiClient:
                 separator = "&" if urllib.parse.urlparse(url).query else "?"
                 url = f"{url}{separator}{encoded_query}"
 
+        target_host = urllib.parse.urlparse(url).hostname or ""
+        api_key = str(self.config.api_key)
+        if is_absolute_url:
+            allowed_hosts: set[str] = {CLOUD_CONNECTOR_HOST}
+            if cloud_host:
+                allowed_hosts.add(cloud_host)
+            base_host = urllib.parse.urlparse(self.config.base_url or "").hostname
+            if base_host:
+                allowed_hosts.add(base_host)
+            if target_host not in allowed_hosts and not self.config.allow_foreign_host:
+                raise UniFiError(
+                    f"Refusing to send the API key to foreign host '{target_host}'.",
+                    code="foreign_host_blocked",
+                    details={
+                        "host": target_host,
+                        "allowed_hosts": sorted(allowed_hosts),
+                        "hint": (
+                            "Pass --allow-foreign-host to override, or target the configured "
+                            "controller or cloud connector host."
+                        ),
+                    },
+                )
+            api_key = self._api_key_for_host(target_host, cloud_host=cloud_host)
+
         data_bytes: bytes | None = None
-        headers = {"Accept": "application/json", "X-API-KEY": str(self.config.api_key)}
+        headers = {"Accept": "application/json", "X-API-KEY": api_key}
         if payload is not None:
             headers["Content-Type"] = "application/json"
             data_bytes = json.dumps(payload).encode("utf-8")
@@ -429,17 +537,34 @@ class UniFiClient:
                 body = response.read()
                 content_type = response.headers.get("Content-Type", "")
         except urllib.error.HTTPError as error:
-            body = error.read().decode("utf-8", errors="replace")
+            raw_body = error.read().decode("utf-8", errors="replace")
+            body_detail: Any
+            try:
+                body_detail = scrub_sensitive(json.loads(raw_body))
+            except (json.JSONDecodeError, ValueError):
+                body_detail = raw_body[:HTTP_ERROR_BODY_MAX_CHARS]
             raise UniFiError(
                 f"{method.upper()} {url} failed with HTTP {error.code}.",
                 code="http_error",
-                details={"body": body, "status": error.code},
+                details={"body": body_detail, "status": error.code},
             ) from error
         except urllib.error.URLError as error:
             raise UniFiError(
                 f"{method.upper()} {url} failed.",
                 code="network_error",
                 details={"reason": str(error.reason)},
+            ) from error
+        except TimeoutError as error:
+            raise UniFiError(
+                f"{method.upper()} {url} timed out.",
+                code="timeout",
+                details={"timeout_seconds": self.config.timeout_seconds},
+            ) from error
+        except OSError as error:
+            raise UniFiError(
+                f"{method.upper()} {url} failed.",
+                code="network_error",
+                details={"reason": str(error)},
             ) from error
 
         if not body:
@@ -525,6 +650,84 @@ class UniFiClient:
         spec = official_resource(resource) if isinstance(resource, str) else resource
         return self.official("GET", self.official_collection_path(spec), query=query)
 
+    def paginate_with_total(
+        self,
+        method_and_path: str,
+        *,
+        extra_query: dict[str, Any] | None = None,
+        limit: int = OFFICIAL_PAGE_LIMIT,
+    ) -> tuple[list[dict[str, Any]], int | None]:
+        """Read every page of an official collection at an arbitrary path.
+
+        Walks the ``offset``/``limit`` envelope pagination until a page is empty,
+        ``offset`` reaches a well-formed ``totalCount``, or a short page (fewer
+        items than ``limit``) signals the end. Guards against infinite loops by
+        stopping whenever a page returns no items or fails to advance the offset.
+        Returns the aggregated items alongside the last-seen well-formed
+        ``totalCount``.
+        """
+        items: list[dict[str, Any]] = []
+        total_count: int | None = None
+        offset = 0
+        while True:
+            query: dict[str, Any] = {"limit": limit, "offset": offset}
+            if extra_query:
+                query.update(extra_query)
+            payload = self.official("GET", method_and_path, query=query)
+            page = extract_data(payload)
+            if not isinstance(page, list) or not page:
+                break
+            items.extend(item for item in page if isinstance(item, dict))
+            page_size = len(page)
+            offset += page_size
+            page_total = payload.get("totalCount") if isinstance(payload, dict) else None
+            if isinstance(page_total, bool):
+                page_total = None
+            if isinstance(page_total, int):
+                total_count = page_total
+                if offset >= page_total:
+                    break
+                # Trust totalCount to drive pagination; keep fetching pages.
+                continue
+            # No usable totalCount: a short page (fewer items than the requested
+            # limit) is the last one, and also guards against a server that
+            # ignores offset and returns the same full page forever.
+            if page_size < limit:
+                break
+        return items, total_count
+
+    def paginate_path(
+        self,
+        method_and_path: str,
+        *,
+        extra_query: dict[str, Any] | None = None,
+        limit: int = OFFICIAL_PAGE_LIMIT,
+    ) -> list[dict[str, Any]]:
+        """Read every page of an official collection at an arbitrary path."""
+        items, _ = self.paginate_with_total(method_and_path, extra_query=extra_query, limit=limit)
+        return items
+
+    def list_all_official(
+        self,
+        resource: str | OfficialResource,
+        *,
+        extra_query: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read every page of a per-site official collection into one list."""
+        spec = official_resource(resource) if isinstance(resource, str) else resource
+        return self.paginate_path(self.official_collection_path(spec), extra_query=extra_query)
+
+    def count_official(self, path: str) -> int:
+        """Count an official collection from its envelope without walking pages."""
+        payload = self.official("GET", path, query={"limit": 1})
+        if isinstance(payload, dict):
+            total = payload.get("totalCount")
+            if isinstance(total, bool):
+                total = None
+            if isinstance(total, int):
+                return total
+        return len(self.paginate_path(path))
+
     def get_official(self, resource: str | OfficialResource, item_id: str) -> Any:
         spec = official_resource(resource) if isinstance(resource, str) else resource
         return self.official("GET", self.official_item_path(spec, item_id))
@@ -545,13 +748,7 @@ class UniFiClient:
                 return item
             raise UniFiError("Unexpected item payload shape.", code="response_shape")
 
-        payload = self.list_official(spec, query={"limit": 500})
-        records = extract_data(payload)
-        if not isinstance(records, list):
-            raise UniFiError(
-                f"Unexpected payload shape for official resource '{spec.name}'.",
-                code="response_shape",
-            )
+        records = self.list_all_official(spec)
 
         exact: list[dict[str, Any]] = []
         partial: list[dict[str, Any]] = []
@@ -690,46 +887,42 @@ class UniFiClient:
         site_id = self.site_id()
         app_info = self.official("GET", "/info")
         sites = self.sites()
-        official_payloads = {
-            "acl_rules": self.official("GET", f"/sites/{site_id}/acl-rules", query={"limit": 500}),
-            "clients": self.official("GET", f"/sites/{site_id}/clients", query={"limit": 500}),
-            "devices": self.official("GET", f"/sites/{site_id}/devices", query={"limit": 500}),
-            "device_tags": self.official(
-                "GET", f"/sites/{site_id}/device-tags", query={"limit": 500}
-            ),
-            "pending_devices": self.official("GET", "/pending-devices", query={"limit": 500}),
-            "dns_policies": self.official(
-                "GET", f"/sites/{site_id}/dns/policies", query={"limit": 500}
-            ),
-            "dpi_categories": self.official("GET", "/dpi/categories", query={"limit": 500}),
-            "dpi_applications": self.official("GET", "/dpi/applications", query={"limit": 500}),
-            "countries": self.official("GET", "/countries", query={"limit": 500}),
-            "firewall_policies": self.official(
-                "GET", f"/sites/{site_id}/firewall/policies", query={"limit": 500}
-            ),
-            "firewall_zones": self.official(
-                "GET", f"/sites/{site_id}/firewall/zones", query={"limit": 500}
-            ),
-            "networks": self.official("GET", f"/sites/{site_id}/networks", query={"limit": 500}),
-            "radius_profiles": self.official(
-                "GET", f"/sites/{site_id}/radius/profiles", query={"limit": 500}
-            ),
-            "traffic_matching_lists": self.official(
-                "GET", f"/sites/{site_id}/traffic-matching-lists", query={"limit": 500}
-            ),
-            "vpn_servers": self.official(
-                "GET", f"/sites/{site_id}/vpn/servers", query={"limit": 500}
-            ),
-            "site_to_site_vpns": self.official(
-                "GET", f"/sites/{site_id}/vpn/site-to-site-tunnels", query={"limit": 500}
-            ),
-            "wans": self.official("GET", f"/sites/{site_id}/wans", query={"limit": 500}),
-            "wifi_broadcasts": self.official(
-                "GET", f"/sites/{site_id}/wifi/broadcasts", query={"limit": 500}
-            ),
+        collection_paths = {
+            "acl_rules": f"/sites/{site_id}/acl-rules",
+            "clients": f"/sites/{site_id}/clients",
+            "devices": f"/sites/{site_id}/devices",
+            "device_tags": f"/sites/{site_id}/device-tags",
+            "pending_devices": "/pending-devices",
+            "dns_policies": f"/sites/{site_id}/dns/policies",
+            "dpi_categories": "/dpi/categories",
+            "dpi_applications": "/dpi/applications",
+            "countries": "/countries",
+            "firewall_policies": f"/sites/{site_id}/firewall/policies",
+            "firewall_zones": f"/sites/{site_id}/firewall/zones",
+            "networks": f"/sites/{site_id}/networks",
+            "radius_profiles": f"/sites/{site_id}/radius/profiles",
+            "traffic_matching_lists": f"/sites/{site_id}/traffic-matching-lists",
+            "vpn_servers": f"/sites/{site_id}/vpn/servers",
+            "site_to_site_vpns": f"/sites/{site_id}/vpn/site-to-site-tunnels",
+            "wans": f"/sites/{site_id}/wans",
+            "wifi_broadcasts": f"/sites/{site_id}/wifi/broadcasts",
         }
-        networks = extract_data(official_payloads["networks"])
-        wifi_broadcasts = extract_data(official_payloads["wifi_broadcasts"])
+        # Only networks and wifi broadcasts are projected into the report; every
+        # other collection needs its count alone, which the envelope's totalCount
+        # provides without walking pages (dpi/applications alone can be thousands).
+        projected_keys = {"networks", "wifi_broadcasts"}
+        collection_items: dict[str, list[dict[str, Any]]] = {}
+        official_counts: dict[str, int] = {}
+        for key, path in collection_paths.items():
+            if key in projected_keys:
+                items, total_count = self.paginate_with_total(path)
+                collection_items[key] = items
+                official_counts[key] = total_count if total_count is not None else len(items)
+            else:
+                official_counts[key] = self.count_official(path)
+
+        networks = collection_items["networks"]
+        wifi_broadcasts = collection_items["wifi_broadcasts"]
         fallback_counts: dict[str, int] = {}
         for name in ["port-profile", "port-forward", "static-route", "traffic-route"]:
             try:
@@ -749,7 +942,7 @@ class UniFiClient:
             },
             "controller": self.config.base_url,
             "counts": {
-                **{key: count_collection(value) for key, value in official_payloads.items()},
+                **official_counts,
                 "sites": len(sites),
             },
             "fallback_counts": fallback_counts,
@@ -799,6 +992,36 @@ def add_list_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--limit", type=int, default=200)
     parser.add_argument("--offset", type=int)
     parser.add_argument("--filter", help="official API filter string")
+    parser.add_argument(
+        "--all",
+        dest="all_pages",
+        action="store_true",
+        help="follow pagination and return every page in one synthetic envelope",
+    )
+
+
+def synthetic_envelope(items: list[dict[str, Any]]) -> dict[str, Any]:
+    """Wrap aggregated items in an official-style envelope for --all results."""
+    count = len(items)
+    return {
+        "count": count,
+        "data": items,
+        "limit": count,
+        "offset": 0,
+        "totalCount": count,
+    }
+
+
+def wants_all_pages(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "all_pages", False))
+
+
+def official_path_list(client: UniFiClient, args: argparse.Namespace, suffix: str) -> Any:
+    """List an official collection at a raw path, honouring --all pagination."""
+    if wants_all_pages(args):
+        extra_query = {"filter": args.filter} if getattr(args, "filter", None) else None
+        return synthetic_envelope(client.paginate_path(suffix, extra_query=extra_query))
+    return client.official("GET", suffix, query=with_limit(args))
 
 
 def require_confirmation(args: argparse.Namespace, method: str, path: str, payload: Any) -> None:
@@ -839,6 +1062,21 @@ def legacy_dry_run_path(client: UniFiClient, suffix: str, *, v2: bool = False) -
     return f"{LEGACY_API_BASE_TEMPLATE.format(site=client.config.site)}{suffix}"
 
 
+def config_file_report(config: Config) -> dict[str, Any]:
+    report: dict[str, Any] = {
+        "exists": config.config_exists,
+        "path": str(config.config_path),
+    }
+    if config.config_exists:
+        try:
+            mode = config.config_path.stat().st_mode & 0o777
+        except OSError:
+            return report
+        report["mode"] = format(mode, "04o")
+        report["permissions_ok"] = not (mode & 0o077)
+    return report
+
+
 def doctor(config: Config) -> tuple[dict[str, Any], bool]:
     report: dict[str, Any] = {
         "api_key_status": {
@@ -850,10 +1088,11 @@ def doctor(config: Config) -> tuple[dict[str, Any], bool]:
             "source": config.sources["base_url"],
             "value": config.base_url,
         },
-        "config_file": {
-            "exists": config.config_exists,
-            "path": str(config.config_path),
+        "cloud_api_key_status": {
+            "configured": bool(config.cloud_api_key),
+            "source": config.sources["cloud_api_key"],
         },
+        "config_file": config_file_report(config),
         "site": {
             "source": config.sources["site"],
             "value": config.site,
@@ -925,6 +1164,13 @@ def format_doctor_human(report: dict[str, Any]) -> str:
         f"TLS verification: {tls_status} [{report['tls_verification']['source']}]",
         f"Timeout: {report['timeout_seconds']}s",
     ]
+    cloud_key = report.get("cloud_api_key_status")
+    if isinstance(cloud_key, dict):
+        cloud_status = "present" if cloud_key["configured"] else "missing"
+        lines.append(f"Cloud API key: {cloud_status} [{cloud_key['source']}]")
+    if report["config_file"].get("permissions_ok") is False:
+        mode = report["config_file"].get("mode", "unknown")
+        lines.append(f"Config file is group/world readable (mode {mode}); chmod 600 recommended")
     if report["missing"]:
         lines.append(f"Missing: {', '.join(report['missing'])}")
 
@@ -955,7 +1201,7 @@ def command_summary(client: UniFiClient, _args: argparse.Namespace) -> Any:
 
 
 def command_sites(client: UniFiClient, args: argparse.Namespace) -> Any:
-    return client.official("GET", "/sites", query=with_limit(args))
+    return official_path_list(client, args, "/sites")
 
 
 def command_official_list(
@@ -963,6 +1209,9 @@ def command_official_list(
     args: argparse.Namespace,
     resource_name: str,
 ) -> Any:
+    if wants_all_pages(args):
+        extra_query = {"filter": args.filter} if getattr(args, "filter", None) else None
+        return synthetic_envelope(client.list_all_official(resource_name, extra_query=extra_query))
     return client.list_official(resource_name, query=with_limit(args))
 
 
@@ -1007,9 +1256,13 @@ def command_official_merge(
                 f"Invalid --set value '{assignment}'. Use dotted.key=value.",
                 code="invalid_argument",
             )
+        reject_read_only_set(assignment)
         key, raw_value = assignment.split("=", 1)
         set_nested(merged, key, parse_json_value(raw_value))
+    # Capture the id before stripping: official update schemas define no id
+    # property, so echoing a GET body straight into a PUT fails HTTP 400.
     item_id = str(current["id"])
+    merged = strip_read_only(merged)
     suffix = client.official_item_path(spec, item_id)
     require_confirmation(args, "PUT", official_dry_run_path(client, suffix), merged)
     return client.official("PUT", suffix, payload=merged)
@@ -1092,7 +1345,7 @@ def command_device_show(client: UniFiClient, args: argparse.Namespace) -> Any:
 
 
 def command_pending_devices(client: UniFiClient, args: argparse.Namespace) -> Any:
-    return client.official("GET", "/pending-devices", query=with_limit(args))
+    return official_path_list(client, args, "/pending-devices")
 
 
 def command_device_adopt(client: UniFiClient, args: argparse.Namespace) -> Any:
@@ -1145,7 +1398,7 @@ def command_port_action(client: UniFiClient, args: argparse.Namespace) -> Any:
 
 
 def command_clients(client: UniFiClient, args: argparse.Namespace) -> Any:
-    return client.official("GET", f"/sites/{client.site_id()}/clients", query=with_limit(args))
+    return official_path_list(client, args, f"/sites/{client.site_id()}/clients")
 
 
 def command_client_show(client: UniFiClient, args: argparse.Namespace) -> Any:
@@ -1276,16 +1529,14 @@ def build_network_references_fallback(
     network_id = str(network["id"])
 
     try:
-        wifi_payload = client.official(
-            "GET", f"/sites/{client.site_id()}/wifi/broadcasts", query={"limit": 500}
-        )
+        wifi_broadcasts = client.paginate_path(f"/sites/{client.site_id()}/wifi/broadcasts")
         wifi_references = [
             {
                 "enabled": wifi.get("enabled"),
                 "name": wifi.get("name"),
                 "referenceId": wifi.get("id"),
             }
-            for wifi in data_list(wifi_payload)
+            for wifi in wifi_broadcasts
             if isinstance(wifi, dict)
             and isinstance(wifi.get("network"), dict)
             and wifi["network"].get("networkId") == network_id
@@ -1494,7 +1745,9 @@ def command_dns_upsert(client: UniFiClient, args: argparse.Namespace) -> Any:
 
     merged = dict(current)
     merged.update(payload)
-    suffix = client.official_item_path(spec, str(current["id"]))
+    item_id = str(current["id"])
+    merged = strip_read_only(merged)
+    suffix = client.official_item_path(spec, item_id)
     require_confirmation(args, "PUT", official_dry_run_path(client, suffix), merged)
     return client.official("PUT", suffix, payload=merged)
 
@@ -1525,33 +1778,27 @@ def command_traffic_matching_lists(client: UniFiClient, args: argparse.Namespace
 
 
 def command_wans(client: UniFiClient, args: argparse.Namespace) -> Any:
-    return client.official("GET", f"/sites/{client.site_id()}/wans", query=with_limit(args))
+    return official_path_list(client, args, f"/sites/{client.site_id()}/wans")
 
 
 def command_radius_profiles(client: UniFiClient, args: argparse.Namespace) -> Any:
-    return client.official(
-        "GET", f"/sites/{client.site_id()}/radius/profiles", query=with_limit(args)
-    )
+    return official_path_list(client, args, f"/sites/{client.site_id()}/radius/profiles")
 
 
 def command_device_tags(client: UniFiClient, args: argparse.Namespace) -> Any:
-    return client.official("GET", f"/sites/{client.site_id()}/device-tags", query=with_limit(args))
+    return official_path_list(client, args, f"/sites/{client.site_id()}/device-tags")
 
 
 def command_vpn_servers(client: UniFiClient, args: argparse.Namespace) -> Any:
-    return client.official("GET", f"/sites/{client.site_id()}/vpn/servers", query=with_limit(args))
+    return official_path_list(client, args, f"/sites/{client.site_id()}/vpn/servers")
 
 
 def command_site_to_site_vpns(client: UniFiClient, args: argparse.Namespace) -> Any:
-    return client.official(
-        "GET", f"/sites/{client.site_id()}/vpn/site-to-site-tunnels", query=with_limit(args)
-    )
+    return official_path_list(client, args, f"/sites/{client.site_id()}/vpn/site-to-site-tunnels")
 
 
 def command_vouchers(client: UniFiClient, args: argparse.Namespace) -> Any:
-    return client.official(
-        "GET", f"/sites/{client.site_id()}/hotspot/vouchers", query=with_limit(args)
-    )
+    return official_path_list(client, args, f"/sites/{client.site_id()}/hotspot/vouchers")
 
 
 def command_voucher_show(client: UniFiClient, args: argparse.Namespace) -> Any:
@@ -1581,15 +1828,15 @@ def command_vouchers_delete(client: UniFiClient, args: argparse.Namespace) -> An
 
 
 def command_dpi_categories(client: UniFiClient, args: argparse.Namespace) -> Any:
-    return client.official("GET", "/dpi/categories", query=with_limit(args))
+    return official_path_list(client, args, "/dpi/categories")
 
 
 def command_dpi_applications(client: UniFiClient, args: argparse.Namespace) -> Any:
-    return client.official("GET", "/dpi/applications", query=with_limit(args))
+    return official_path_list(client, args, "/dpi/applications")
 
 
 def command_countries(client: UniFiClient, args: argparse.Namespace) -> Any:
-    return client.official("GET", "/countries", query=with_limit(args))
+    return official_path_list(client, args, "/countries")
 
 
 def command_connector_request(
@@ -1600,9 +1847,10 @@ def command_connector_request(
     payload = parse_data_json(args.data_json) if args.data_json else None
     query = parse_query_pairs(args.query)
     url = connector_dry_run_path(args.cloud_base_url, args.console_id, args.path)
+    cloud_host = urllib.parse.urlparse(args.cloud_base_url).hostname
     if method.upper() != "GET":
         require_confirmation(args, method, path_with_query(url, query), payload)
-    return client.request(method, url, query=query, payload=payload)
+    return client.request(method, url, query=query, payload=payload, cloud_host=cloud_host)
 
 
 def command_legacy_fallback_types(_client: UniFiClient, _args: argparse.Namespace) -> Any:
@@ -1642,9 +1890,10 @@ def command_legacy_fallback_merge(client: UniFiClient, args: argparse.Namespace)
         key, raw_value = assignment.split("=", 1)
         set_nested(merged, key, parse_json_value(raw_value))
 
-    item_id = str(current.get("_id") or current.get("id"))
-    if not item_id:
+    raw_id = current.get("_id") or current.get("id")
+    if not raw_id:
         raise UniFiError("Legacy fallback object has no usable id.", code="response_shape")
+    item_id = str(raw_id)
     suffix, use_v2 = client.legacy_fallback_path(spec)
     path = f"{suffix}/{item_id}"
     require_confirmation(args, "PUT", legacy_dry_run_path(client, path, v2=use_v2), merged)
@@ -1656,9 +1905,10 @@ def command_legacy_fallback_merge(client: UniFiClient, args: argparse.Namespace)
 def command_legacy_fallback_delete(client: UniFiClient, args: argparse.Namespace) -> Any:
     spec = legacy_resource(args.resource)
     current = client.find_legacy_fallback(args.resource, args.selector)
-    item_id = str(current.get("_id") or current.get("id"))
-    if not item_id:
+    raw_id = current.get("_id") or current.get("id")
+    if not raw_id:
         raise UniFiError("Legacy fallback object has no usable id.", code="response_shape")
+    item_id = str(raw_id)
     suffix, use_v2 = client.legacy_fallback_path(spec)
     path = f"{suffix}/{item_id}"
     require_confirmation(args, "DELETE", legacy_dry_run_path(client, path, v2=use_v2), current)
@@ -1710,27 +1960,11 @@ def score_label(score: int) -> str:
 
 def build_firewall_audit_report(client: UniFiClient) -> dict[str, Any]:
     site_id = client.site_id()
-    networks_payload = client.official("GET", f"/sites/{site_id}/networks", query={"limit": 500})
-    policies_payload = client.official(
-        "GET", f"/sites/{site_id}/firewall/policies", query={"limit": 500}
-    )
-    zones_payload = client.official("GET", f"/sites/{site_id}/firewall/zones", query={"limit": 500})
-    devices_payload = client.official("GET", f"/sites/{site_id}/devices", query={"limit": 500})
-    acl_payload = client.official("GET", f"/sites/{site_id}/acl-rules", query={"limit": 500})
-
-    networks = extract_data(networks_payload)
-    policies = extract_data(policies_payload)
-    zones = extract_data(zones_payload)
-    devices = extract_data(devices_payload)
-    acl_rules = extract_data(acl_payload)
-    if not isinstance(networks, list) or not isinstance(policies, list):
-        raise UniFiError("Unexpected official firewall audit payload shape.", code="response_shape")
-    if not isinstance(zones, list):
-        zones = []
-    if not isinstance(devices, list):
-        devices = []
-    if not isinstance(acl_rules, list):
-        acl_rules = []
+    networks = client.paginate_path(f"/sites/{site_id}/networks")
+    policies = client.paginate_path(f"/sites/{site_id}/firewall/policies")
+    zones = client.paginate_path(f"/sites/{site_id}/firewall/zones")
+    devices = client.paginate_path(f"/sites/{site_id}/devices")
+    acl_rules = client.paginate_path(f"/sites/{site_id}/acl-rules")
 
     user_policies = [
         policy for policy in policies if isinstance(policy, dict) and policy_is_user_defined(policy)
