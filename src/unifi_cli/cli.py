@@ -9,6 +9,7 @@ from collections.abc import Callable
 from typing import Any
 
 from unifi_cli import __version__
+from unifi_cli.audit import command_firewall_audit, command_firewall_matrix
 from unifi_cli.config import build_config, default_config_path
 from unifi_cli.core import (
     LEGACY_RESOURCES,
@@ -40,7 +41,6 @@ from unifi_cli.core import (
     command_dns_upsert,
     command_dpi_applications,
     command_dpi_categories,
-    command_firewall_audit,
     command_firewall_policies,
     command_firewall_zones,
     command_legacy_fallback_create,
@@ -89,6 +89,14 @@ from unifi_cli.core import (
     format_doctor_human,
     format_list_table,
     scrub_sensitive,
+)
+from unifi_cli.snapshot import (
+    command_backup_download,
+    command_backup_generate,
+    command_backup_list,
+    command_diff,
+    command_snapshot,
+    diff_exit_code,
 )
 
 CommandFunc = Callable[..., Any]
@@ -508,6 +516,18 @@ def build_parser() -> argparse.ArgumentParser:
     firewall_audit.add_argument("--format", choices=["json", "human"], default="json")
     firewall_audit.set_defaults(func=command_firewall_audit)
 
+    firewall_matrix = subparsers.add_parser(
+        "firewall-matrix",
+        help="build a zone x zone firewall policy matrix from official data",
+    )
+    firewall_matrix.add_argument(
+        "--format",
+        choices=["json", "human"],
+        default=None,
+        help="output format (default: human on a TTY, JSON otherwise)",
+    )
+    firewall_matrix.set_defaults(func=command_firewall_matrix)
+
     for name, func, help_text in [
         ("wans", command_wans, "list official WAN interfaces"),
         ("radius-profiles", command_radius_profiles, "list official RADIUS profiles"),
@@ -635,6 +655,68 @@ def build_parser() -> argparse.ArgumentParser:
         add_connector_args(connector)
         connector.set_defaults(func=bind(command_connector_request, method))
 
+    snapshot_parser = subparsers.add_parser(
+        "snapshot",
+        help="write a per-collection JSON snapshot of the controller config to a directory",
+    )
+    snapshot_parser.add_argument(
+        "--dir",
+        help="output directory (default: ./unifi-snapshot-<UTC timestamp>)",
+    )
+    snapshot_parser.set_defaults(func=command_snapshot)
+
+    diff_parser = subparsers.add_parser(
+        "diff",
+        help="diff live controller config against a snapshot directory",
+    )
+    diff_parser.add_argument("--dir", required=True, help="snapshot directory to compare against")
+    diff_parser.add_argument(
+        "--collection",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="restrict the diff to one or more collections (repeatable)",
+    )
+    diff_parser.add_argument(
+        "--format",
+        choices=["json", "human"],
+        default=None,
+        help="output format (default: human on a TTY, JSON otherwise)",
+    )
+    diff_parser.add_argument(
+        "--exit-code",
+        action="store_true",
+        help="exit 1 when differences are found (0 otherwise) for scripting",
+    )
+    diff_parser.set_defaults(func=command_diff)
+
+    backup_list = subparsers.add_parser(
+        "backup-list", help="list controller autobackups via the legacy backup command"
+    )
+    backup_list.set_defaults(func=command_backup_list)
+
+    backup_generate = subparsers.add_parser(
+        "backup-generate", help="generate a controller backup server-side (legacy backup command)"
+    )
+    backup_generate.add_argument(
+        "--days",
+        type=int,
+        default=-1,
+        help="history days to include; -1 (default) means settings-only, 0 means all history",
+    )
+    add_write_guard(backup_generate)
+    backup_generate.set_defaults(func=command_backup_generate)
+
+    backup_download = subparsers.add_parser(
+        "backup-download", help="download a controller backup .unf file (contains secrets)"
+    )
+    backup_download.add_argument("--output", required=True, help="local file path to write")
+    backup_download.add_argument(
+        "--path",
+        help="explicit backup path or URL; default picks the newest autobackup",
+    )
+    backup_download.set_defaults(func=command_backup_download)
+
     request_parser = subparsers.add_parser(
         "request",
         aliases=["raw"],
@@ -701,16 +783,19 @@ def main(argv: list[str] | None = None) -> int:
             raise UniFiError("No command selected.", code="invalid_argument")
 
         result = args.func(client, args)
+        # diff --exit-code signals drift via the exit code; every other command
+        # keeps returning 0 on success.
+        success_code = diff_exit_code(args) if args.command == "diff" else 0
         if not args.json and sys.stdout.isatty():
             table = format_list_table(args.command, result)
             if table is not None:
                 print(table)
-                return 0
+                return success_code
         if args.json or not isinstance(result, str):
             emit_json(result)
         else:
             print(result)
-        return 0
+        return success_code
     except UniFiError as error:
         if error.code == "dry_run":
             details = error.details or {}

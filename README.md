@@ -50,6 +50,12 @@ the preferred path.
   verification
 - `schema` command that introspects the command tree into agent-facing JSON
   (commands, flags, exit codes, and which commands write), fully offline
+- `firewall-matrix` and a zone-centric scored `firewall-audit` built from fully
+  paginated official firewall, network, ACL, and device data
+- `snapshot` and `diff` commands for point-in-time config capture and
+  git-status-style drift detection
+- backup verbs for listing, generating, and downloading controller `.unf`
+  backups via the legacy API
 - human table output on a TTY for common list commands, with JSON preserved when
   output is piped or `--json` is passed
 - raw API escape hatch that stays read-only by default
@@ -196,6 +202,7 @@ Official reads:
 - `firewall-policy-show`
 - `firewall-policy-ordering`
 - `firewall-audit`
+- `firewall-matrix`
 - `acl-rules`
 - `acl-rule-show`
 - `acl-rule-ordering`
@@ -258,6 +265,17 @@ Official guarded writes:
 - `voucher-delete`
 - `vouchers-delete`
 
+Snapshots and drift:
+
+- `snapshot`
+- `diff`
+
+Backups (legacy API):
+
+- `backup-list`
+- `backup-generate`
+- `backup-download`
+
 Official Cloud Connector:
 
 - `connector-get`
@@ -318,6 +336,40 @@ render aligned, truncated human tables with a `N of M` footer: `devices`,
 commands still emit JSON, so piping without `--json` keeps stable machine output
 for agents. Pass `--json` to force JSON everywhere; commands without a table spec
 are unaffected.
+
+## Snapshots and Drift Detection
+
+`unifi snapshot [--dir PATH]` writes one sorted JSON file per collection into a
+directory (default `./unifi-snapshot-<UTC timestamp>`). It captures every
+official per-site collection the CLI knows plus the legacy fallbacks
+(`legacy-<name>.json`), a `_meta.json` (timestamp, controller host, application
+and CLI versions, per-collection counts), and `_errors.json` when any
+collection fails. Volatile fields (uptime, last-seen, statistics, and similar)
+are stripped from `clients` and `devices` so diffs stay stable; config
+collections are captured verbatim. Snapshots only write to local disk, so no
+`--yes` is required.
+
+`unifi diff --dir PATH [--collection NAME ...]` re-reads the live controller
+for the collections the snapshot directory contains and reports added, removed,
+and changed items per collection. On a TTY (or with `--format human`) it prints
+a git-status-like summary; piped output is JSON. Pass `--exit-code` to exit `1`
+when differences exist, for scripting; without it the command always exits `0`.
+
+## Backups
+
+- `backup-list` lists controller backups via the legacy `/cmd/backup` command.
+- `backup-generate [--days N]` asks the controller to create a backup file
+  server-side. The default `--days -1` means settings-only; `--days 0` includes
+  all history. This is a guarded write: pass `--yes` to apply.
+- `backup-download --output FILE [--path SERVERPATH]` downloads a backup as
+  binary. Without `--path` it picks the newest entry from `backup-list` and
+  fetches it from the autobackup download path; with `--path` the given path or
+  URL is used verbatim.
+
+> **Warning:** `.unf` backup files contain secrets — device credentials, WiFi
+> passphrases, RADIUS/VPN keys, and more. Store downloaded backups somewhere
+> safe (encrypted disk or vault), never commit them to a repository, and treat
+> them like credentials.
 
 ## Exit Codes
 

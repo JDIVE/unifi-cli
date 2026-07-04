@@ -7,12 +7,12 @@ import copy
 import json
 import re
 import ssl
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import Any
 
 from unifi_cli import __version__
@@ -626,6 +626,85 @@ class UniFiClient:
             except json.JSONDecodeError:
                 return {"raw": text}
         return {"raw": text}
+
+    def request_bytes(
+        self,
+        method: str,
+        path: str,
+        *,
+        query: dict[str, Any] | None = None,
+        cloud_host: str | None = None,
+    ) -> bytes:
+        """Send a request and return the raw response body without JSON parsing.
+
+        Shares the same auth, TLS, timeout, and foreign-host guard handling as
+        :meth:`request`; used for binary downloads such as controller backups.
+        """
+        is_absolute_url = path.startswith("http://") or path.startswith("https://")
+        ensure_live_config(self.config, require_base_url=not is_absolute_url)
+        url = path if is_absolute_url else f"{self.config.base_url}{path}"
+
+        if query:
+            encoded_query = urllib.parse.urlencode(
+                [(key, str(value)) for key, value in query.items() if value is not None],
+                doseq=True,
+            )
+            if encoded_query:
+                separator = "&" if urllib.parse.urlparse(url).query else "?"
+                url = f"{url}{separator}{encoded_query}"
+
+        target_host = urllib.parse.urlparse(url).hostname or ""
+        api_key = str(self.config.api_key)
+        if is_absolute_url:
+            allowed_hosts: set[str] = {CLOUD_CONNECTOR_HOST}
+            if cloud_host:
+                allowed_hosts.add(cloud_host)
+            base_host = urllib.parse.urlparse(self.config.base_url or "").hostname
+            if base_host:
+                allowed_hosts.add(base_host)
+            if target_host not in allowed_hosts and not self.config.allow_foreign_host:
+                raise UniFiError(
+                    f"Refusing to send the API key to foreign host '{target_host}'.",
+                    code="foreign_host_blocked",
+                    details={"host": target_host, "allowed_hosts": sorted(allowed_hosts)},
+                )
+            api_key = self._api_key_for_host(target_host, cloud_host=cloud_host)
+
+        headers = {"Accept": "application/octet-stream", "X-API-KEY": api_key}
+        request = urllib.request.Request(url, method=method.upper(), headers=headers)
+
+        try:
+            with urllib.request.urlopen(  # noqa: S310
+                request,
+                context=self.ssl_context,
+                timeout=self.config.timeout_seconds,
+            ) as response:
+                return bytes(response.read())
+        except urllib.error.HTTPError as error:
+            raw_body = error.read().decode("utf-8", errors="replace")
+            raise UniFiError(
+                f"{method.upper()} {url} failed with HTTP {error.code}.",
+                code="http_error",
+                details={"body": raw_body[:HTTP_ERROR_BODY_MAX_CHARS], "status": error.code},
+            ) from error
+        except urllib.error.URLError as error:
+            raise UniFiError(
+                f"{method.upper()} {url} failed.",
+                code="network_error",
+                details={"reason": str(error.reason)},
+            ) from error
+        except TimeoutError as error:
+            raise UniFiError(
+                f"{method.upper()} {url} timed out.",
+                code="timeout",
+                details={"timeout_seconds": self.config.timeout_seconds},
+            ) from error
+        except OSError as error:
+            raise UniFiError(
+                f"{method.upper()} {url} failed.",
+                code="network_error",
+                details={"reason": str(error)},
+            ) from error
 
     def official(self, method: str, suffix: str, **kwargs: Any) -> Any:
         return self.request(method, f"{OFFICIAL_API_BASE}{suffix}", **kwargs)
@@ -1502,6 +1581,22 @@ def render_table(
     return "\n".join(lines)
 
 
+def wants_human_format(args: argparse.Namespace) -> bool:
+    """Decide whether a ``--format json|human`` command should render human output.
+
+    An explicit ``--format`` always wins. Without one, a TTY without ``--json``
+    renders human output; piped output stays JSON so agents keep stable shapes.
+    """
+    if getattr(args, "json", False):
+        return False
+    fmt = getattr(args, "format", None)
+    if fmt == "human":
+        return True
+    if fmt == "json":
+        return False
+    return sys.stdout.isatty()
+
+
 def format_list_table(command: str, payload: Any) -> str | None:
     """Render a list payload as a human table if the command has a spec.
 
@@ -2277,297 +2372,6 @@ def command_legacy_fallback_delete(client: UniFiClient, args: argparse.Namespace
     if use_v2:
         return client.legacy_v2("DELETE", path)
     return client.legacy("DELETE", path)
-
-
-def network_role(network: dict[str, Any]) -> str:
-    name = str(network.get("name", "")).lower()
-    vlan = network.get("vlanId")
-    if "management" in name or vlan == 10:
-        return "management"
-    if "storage" in name or vlan == 20:
-        return "storage"
-    if "lab" in name or vlan == 30:
-        return "lab"
-    if "home" in name or vlan == 40:
-        return "home"
-    if "iot" in name or vlan == 50:
-        return "iot"
-    if "dmz" in name or vlan == 60:
-        return "dmz"
-    if "work" in name or vlan == 255:
-        return "work"
-    if name == "default" or vlan == 1:
-        return "default"
-    return "other"
-
-
-def policy_is_user_defined(policy: dict[str, Any]) -> bool:
-    metadata = policy.get("metadata")
-    if isinstance(metadata, dict):
-        return metadata.get("origin") == "USER_DEFINED"
-    return bool(policy.get("predefined") is False)
-
-
-def severity_score(severity: str) -> int:
-    return {"critical": 5, "warning": 2, "informational": 1}.get(severity, 0)
-
-
-def score_label(score: int) -> str:
-    if score >= 80:
-        return "healthy"
-    if score >= 60:
-        return "needs_attention"
-    return "critical"
-
-
-def build_firewall_audit_report(client: UniFiClient) -> dict[str, Any]:
-    site_id = client.site_id()
-    networks = client.paginate_path(f"/sites/{site_id}/networks")
-    policies = client.paginate_path(f"/sites/{site_id}/firewall/policies")
-    zones = client.paginate_path(f"/sites/{site_id}/firewall/zones")
-    devices = client.paginate_path(f"/sites/{site_id}/devices")
-    acl_rules = client.paginate_path(f"/sites/{site_id}/acl-rules")
-
-    user_policies = [
-        policy for policy in policies if isinstance(policy, dict) and policy_is_user_defined(policy)
-    ]
-    enabled_user_policies = [policy for policy in user_policies if policy.get("enabled", True)]
-    online_devices = [
-        device for device in devices if str(device.get("state", "")).upper() == "ONLINE"
-    ]
-    offline_devices = [
-        device for device in devices if str(device.get("state", "")).upper() != "ONLINE"
-    ]
-
-    zone_networks: dict[str, list[dict[str, Any]]] = {}
-    for network in networks:
-        if not isinstance(network, dict):
-            continue
-        zone_id = str(network.get("zoneId") or "")
-        if zone_id:
-            zone_networks.setdefault(zone_id, []).append(network)
-
-    findings: list[dict[str, Any]] = []
-
-    def add_finding(
-        benchmark_id: str,
-        category: str,
-        severity: str,
-        message: str,
-        *,
-        evidence: dict[str, Any] | None = None,
-        recommendation: str | None = None,
-    ) -> None:
-        item: dict[str, Any] = {
-            "benchmark_id": benchmark_id,
-            "category": category,
-            "message": message,
-            "severity": severity,
-        }
-        if evidence:
-            item["evidence"] = evidence
-        if recommendation:
-            item["recommendation"] = recommendation
-        findings.append(item)
-
-    sensitive_roles = {"dmz", "iot", "management", "storage", "work"}
-    for zone_id, members in zone_networks.items():
-        roles = {network_role(member) for member in members}
-        if len(members) <= 1:
-            continue
-        if roles & sensitive_roles and not enabled_user_policies:
-            add_finding(
-                "SEG-01",
-                "segmentation",
-                "critical",
-                "Sensitive networks share a firewall zone and no enabled user-defined "
-                "firewall policies were found.",
-                evidence={
-                    "roles": sorted(roles),
-                    "zone_id": zone_id,
-                    "networks": [member.get("name") for member in members],
-                },
-                recommendation=(
-                    "Use explicit user-defined firewall policies or separate firewall zones "
-                    "before trusting this as a segmented network."
-                ),
-            )
-
-    if len(networks) > 1 and not enabled_user_policies:
-        add_finding(
-            "SEG-02",
-            "segmentation",
-            "warning",
-            "Multiple networks exist but no enabled user-defined firewall policies were found.",
-            evidence={"network_count": len(networks), "user_policy_count": 0},
-            recommendation="Add named policies for the intended inter-network trust model.",
-        )
-
-    dns_specific_policies = [
-        policy for policy in enabled_user_policies if "53" in json.dumps(policy, sort_keys=True)
-    ]
-    if not dns_specific_policies:
-        add_finding(
-            "EGR-01",
-            "egress_control",
-            "warning",
-            "No explicit DNS-control firewall policy was detected.",
-            evidence={"custom_dns_policy_count": 0},
-            recommendation=(
-                "If DNS pinning matters, add explicit policy for approved resolvers rather "
-                "than relying only on DHCP convention."
-            ),
-        )
-
-    placeholder_named_policies = [
-        policy.get("name")
-        for policy in user_policies
-        if re.fullmatch(
-            r"(rule|new rule|untitled)( \d+)?", str(policy.get("name", "")).strip().lower()
-        )
-        or re.fullmatch(r"\d+", str(policy.get("name", "")).strip())
-    ]
-    if placeholder_named_policies:
-        add_finding(
-            "HYG-01",
-            "rule_hygiene",
-            "warning",
-            "Some user-defined firewall policies have placeholder-style names.",
-            evidence={"placeholder_names": placeholder_named_policies},
-            recommendation="Rename policies so future audits and changes are easier to review.",
-        )
-
-    if offline_devices:
-        add_finding(
-            "TOP-01",
-            "topology",
-            "critical",
-            "One or more UniFi devices are offline during the audit.",
-            evidence={"offline_devices": [device.get("name") for device in offline_devices]},
-            recommendation="Bring offline network devices back before trusting topology checks.",
-        )
-
-    categories: dict[str, dict[str, Any]] = {
-        "egress_control": {"max": 25},
-        "rule_hygiene": {"max": 25},
-        "segmentation": {"max": 25},
-        "topology": {"max": 25},
-    }
-    for category in categories:
-        category_findings = [finding for finding in findings if finding["category"] == category]
-        deduction = sum(severity_score(finding["severity"]) for finding in category_findings)
-        categories[category] = {
-            "findings": category_findings,
-            "max": 25,
-            "score": max(0, 25 - deduction),
-        }
-
-    overall_score = sum(item["score"] for item in categories.values())
-    recommendations = [
-        finding["recommendation"] for finding in findings if finding.get("recommendation")
-    ]
-
-    return {
-        "api_surface": "official_network_integration_v1",
-        "categories": categories,
-        "critical_findings": [finding for finding in findings if finding["severity"] == "critical"],
-        "ok": True,
-        "overall_score": overall_score,
-        "overall_status": score_label(overall_score),
-        "recommendations": recommendations,
-        "summary": {
-            "acl_rules": len(acl_rules),
-            "devices_offline": len(offline_devices),
-            "devices_online": len(online_devices),
-            "firewall_policies": len(policies),
-            "firewall_zones": len(zones),
-            "networks": len(networks),
-            "user_defined_firewall_policies": len(user_policies),
-            "zone_map": [
-                {
-                    "networks": [member.get("name") for member in members],
-                    "roles": sorted({network_role(member) for member in members}),
-                    "zone_id": zone_id,
-                }
-                for zone_id, members in zone_networks.items()
-            ],
-        },
-        "timestamp": datetime.now(UTC).isoformat(),
-    }
-
-
-def format_firewall_audit_human(report: dict[str, Any]) -> str:
-    lines = [
-        f"Firewall audit score: {report['overall_score']}/100 ({report['overall_status']})",
-        f"API surface: {report['api_surface']}",
-        "",
-        "Category scores:",
-    ]
-    labels = {
-        "egress_control": "Egress Control",
-        "rule_hygiene": "Rule Hygiene",
-        "segmentation": "Segmentation",
-        "topology": "Topology",
-    }
-    for key in ["segmentation", "egress_control", "rule_hygiene", "topology"]:
-        category = report["categories"][key]
-        lines.append(f"- {labels[key]}: {category['score']}/{category['max']}")
-
-    summary = report["summary"]
-    lines.extend(
-        [
-            "",
-            "Summary:",
-            f"- Networks: {summary['networks']}",
-            f"- Firewall zones: {summary['firewall_zones']}",
-            "- Firewall policies: "
-            f"{summary['firewall_policies']} "
-            f"({summary['user_defined_firewall_policies']} user-defined)",
-            f"- ACL rules: {summary['acl_rules']}",
-            f"- Devices online/offline: {summary['devices_online']}/{summary['devices_offline']}",
-        ]
-    )
-    zone_lines = ", ".join(
-        f"{', '.join(zone['networks'])} ({', '.join(zone['roles'])})"
-        for zone in summary["zone_map"]
-    )
-    lines.append(f"- Zone map: {zone_lines or 'none'}")
-
-    lines.append("")
-    lines.append("Critical findings:")
-    if report["critical_findings"]:
-        for finding in report["critical_findings"]:
-            lines.append(f"- [{finding['benchmark_id']}] {finding['message']}")
-    else:
-        lines.append("- None")
-
-    lines.append("")
-    lines.append("Other findings:")
-    non_critical = [
-        finding
-        for finding in sum((cat["findings"] for cat in report["categories"].values()), [])
-        if finding["severity"] != "critical"
-    ]
-    if non_critical:
-        for finding in non_critical:
-            lines.append(f"- [{finding['benchmark_id']}] {finding['message']}")
-    else:
-        lines.append("- None")
-
-    if report["recommendations"]:
-        lines.append("")
-        lines.append("Recommendations:")
-        for recommendation in report["recommendations"]:
-            lines.append(f"- {recommendation}")
-
-    return "\n".join(lines)
-
-
-def command_firewall_audit(client: UniFiClient, args: argparse.Namespace) -> Any:
-    report = build_firewall_audit_report(client)
-    if args.format == "human" and not args.json:
-        return format_firewall_audit_human(report)
-    return report
 
 
 def command_request(client: UniFiClient, args: argparse.Namespace) -> Any:
